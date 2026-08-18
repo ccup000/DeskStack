@@ -1,0 +1,17 @@
+# 构建产物
+build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.log
+
+# CMake 生成文件
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# IDE
+.vs/
+.vscode/
