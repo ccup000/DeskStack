@@ -310,8 +310,10 @@ PanelWindow::PanelWindow(ContainerWindow* owner, const ContainerData& data)
         m_centers[i].x = centers[i].x - m_windowX;
         m_centers[i].y = centers[i].y - m_windowY;
     }
-    // 面板中心（客户端）＝触发容器屏幕中心 − 面板左上
-    m_cx = cex - m_windowX; m_cy = cey - m_windowY;
+    // 面板中心（客户端）＝最终使用的屏幕圆心 − 面板左上
+    // （环形可能因屏幕边界被平移，不能直接用触发容器中心）
+    m_cx = m_screenCenterX - m_windowX;
+    m_cy = m_screenCenterY - m_windowY;
 
     // 依据“实际区域”（图标+文字包围盒）构造每个条目的 plate
     m_plates.resize(m_centers.size());
@@ -445,6 +447,8 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
     GetWindowRect(ctx, &cr);
     int cex = cr.left + (cr.right - cr.left) / 2;
     int cey = cr.top + (cr.bottom - cr.top) / 2;
+    m_screenCenterX = cex;
+    m_screenCenterY = cey;
 
     int iconSize = desktop::IconSize();   // 系统实际图标尺寸
     int pad = util::Scaled(12);
@@ -577,9 +581,23 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
     const double PI = 3.141592653589793;
     int compactR0 = util::Scaled(120);
     int RinFloor  = util::Scaled(40);
-    int Rmax = halfDiag - bandT / 2;          // 外层不超出屏幕
+    int Rmax = halfDiag - bandT / 2;          // 外层不超出屏幕（尺寸约束）
     int Rmin = RinFloor + bandT / 2;          // 内镂空不小于最小值
     if (Rmax < Rmin) Rmax = Rmin;
+
+    // 仅环形需要额外按“容器中心到屏幕边缘”限制外径，避免外径超出屏幕。
+    int ringRmax = Rmax;
+    {
+        int maxByCenter = (int)std::min({
+            cex - wa2.left,
+            wa2.right - cex,
+            cey - wa2.top,
+            wa2.bottom - cey
+        });
+        int centerRmax = maxByCenter - bandT / 2 - util::Scaled(4);
+        if (centerRmax < ringRmax) ringRmax = centerRmax;
+        if (ringRmax < Rmin) ringRmax = Rmin;
+    }
 
     int R = compactR0;
     double aDeg = 360.0;
@@ -595,7 +613,7 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
         R = (int)(needR + 0.5);
         if (R < Rmin) R = Rmin;
         if (R < compactR0) R = compactR0;
-        if (R > Rmax) R = Rmax;
+        if (R > ringRmax) R = ringRmax;
         aDeg = 360.0;
     } else {
         // 扇形：紧凑优先。最小 60°，最大 180°。
@@ -716,13 +734,39 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
     }
     minx = std::min(minx, cex - Rout); maxx = std::max(maxx, cex + Rout);
     miny = std::min(miny, cey - Rout); maxy = std::max(maxy, cey + Rout);
-    minx -= util::Scaled(4); miny -= util::Scaled(4);
+
+    int winMargin = util::Scaled(4);
+    // 环形专用：面板窗口中心不强制固定为容器中心。
+    // 若“圆心+外径”会超出屏幕，则把整个环形（圆心与所有条目）向反方向平移，留 20px 空白。
+    if (m_data.style == ExpandStyle::Ring) {
+        int ringMargin = util::Scaled(20);
+        int left = minx - winMargin;
+        int top = miny - winMargin;
+        int right = maxx + winMargin;
+        int bottom = maxy + winMargin;
+        int dx = 0, dy = 0;
+        if (left < wa2.left + ringMargin) dx = wa2.left + ringMargin - left;
+        else if (right > wa2.right - ringMargin) dx = wa2.right - ringMargin - right;
+        if (top < wa2.top + ringMargin) dy = wa2.top + ringMargin - top;
+        else if (bottom > wa2.bottom - ringMargin) dy = wa2.bottom - ringMargin - bottom;
+        if (dx != 0 || dy != 0) {
+            for (auto& c : centers) { c.x += dx; c.y += dy; }
+            cex += dx; cey += dy;
+            m_screenCenterX = cex;
+            m_screenCenterY = cey;
+            minx += dx; maxx += dx;
+            miny += dy; maxy += dy;
+        }
+    }
+
+    minx -= winMargin; miny -= winMargin;
     m_windowX = minx; m_windowY = miny;
     int w = maxx - minx + util::Scaled(8), h = maxy - miny + util::Scaled(8);
-    if (m_windowX < wa2.left) { int dx = wa2.left - m_windowX; m_windowX += dx; }
-    if (m_windowY < wa2.top)  { int dy = wa2.top - m_windowY; m_windowY += dy; }
-    if (m_windowX + w > wa2.right) { m_windowX = wa2.right - w; }
-    if (m_windowY + h > wa2.bottom) { m_windowY = wa2.bottom - h; }
+    // 窗口钳制到工作区内，并保留边距，避免面板贴到屏幕边缘
+    if (m_windowX < wa2.left + winMargin) m_windowX = wa2.left + winMargin;
+    if (m_windowY < wa2.top + winMargin)  m_windowY = wa2.top + winMargin;
+    if (m_windowX + w > wa2.right - winMargin) m_windowX = wa2.right - winMargin - w;
+    if (m_windowY + h > wa2.bottom - winMargin) m_windowY = wa2.bottom - winMargin - h;
     m_windowW = w; m_windowH = h;
     m_iconSize = iconSize;
     m_radius = R; m_rout = Rout; m_rin = Rin;

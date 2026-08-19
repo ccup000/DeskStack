@@ -46,6 +46,8 @@ private:
     int m_hoverItem = -1;               // 当前 hover 条目（Windows 式底色）
     // 面板中心（客户区坐标，即触发容器中心）：Fan/Ring 以此为圆心绘制背景形状
     int m_cx = 0, m_cy = 0;
+    // 扇形/环形最终使用的屏幕圆心（可能因屏幕边界而相对容器中心平移）
+    int m_screenCenterX = 0, m_screenCenterY = 0;
     int m_radius = 0;      // Fan/Ring 图标中心半径
     int m_rout = 0, m_rin = 0; // 外/内半径
     double m_aDeg = 0;     // Fan/Ring 展开角（度），与背景绘制一致
