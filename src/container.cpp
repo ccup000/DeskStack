@@ -410,6 +410,10 @@ void ContainerWindow::Render() {
     layered::Present(m_hwnd, w, h, wr.left, wr.top,
         [&](Graphics& g, int ww, int hh) {
             g.Clear(Color(0, 0, 0, 0));
+            // 用 alpha=1 的不可见底色铺满整个窗口，保证透明区域也能被鼠标命中，
+            // 避免容器因内容透明而无法点击/拖动。
+            SolidBrush hitBrush(Color(1, 0, 0, 0));
+            g.FillRectangle(&hitBrush, 0, 0, ww, hh);
             int icon = desktop::DesktopIconSize();   // 按桌面实际图标尺寸绘制，与系统桌面图标一致
             int x = (ww - icon) / 2, y = util::Scaled(6);
             Bitmap* iconBmp = iconlib::IconBitmapForPath(m_data.iconPath, icon);
