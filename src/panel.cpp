@@ -32,6 +32,68 @@ void FillRounded(Graphics& g, int x, int y, int w, int h, int r, const Color& c)
     g.FillPath(&br, &gp);
 }
 
+int EstimateTextWidth(const WCHAR* text, int fontSize) {
+    if (!text) return 0;
+    int w = 0;
+    for (const WCHAR* p = text; *p; p++) {
+        if (*p >= 0x4E00 && *p <= 0x9FFF) w += fontSize;       // 中日韩
+        else w += (int)(fontSize * 0.55f);
+    }
+    return w;
+}
+
+// 文字换行相关常量（可能后续需要微调）
+const int kTextCharsPerLine = 6;    // 每行最多约 6 个中文字符
+const int kTextMaxLines = 3;        // 最多 3 行
+
+// 布局用的文字宽度：限制在合理范围内（过长用省略号），避免间距/半径被长名撑大
+int LayoutLabelWidth(const WCHAR* t, int fontSize) {
+    int w = EstimateTextWidth(t, fontSize);
+    int cap = fontSize * kTextCharsPerLine;   // 每行宽度上限约 6 字宽
+    return w < cap ? w : cap;
+}
+
+// 将文本按最多 kTextCharsPerLine 字符/行、最多 kTextMaxLines 行进行换行。
+// 有空格时优先按空格断行；超出 3 行时第 3 行末尾加省略号。
+std::vector<std::wstring> WrapText(const std::wstring& text, int maxChars, int maxLines) {
+    std::vector<std::wstring> result;
+    if (text.empty()) return { L"" };
+    if ((int)text.size() <= maxChars) return { text };
+
+    size_t start = 0;
+    while (start < text.size() && (int)result.size() < maxLines) {
+        size_t end = std::min(start + maxChars, text.size());
+        // 优先在空格处断行
+        if (end < text.size()) {
+            size_t sp = text.rfind(L' ', end);
+            if (sp != std::wstring::npos && sp > start)
+                end = sp;
+        }
+
+        if ((int)result.size() == maxLines - 1) {
+            // 最后一行：若还有剩余，截断并加省略号
+            if (end < text.size()) {
+                size_t keep = start + (maxChars > 1 ? maxChars - 1 : 0);
+                if (keep < start) keep = start;
+                std::wstring last = text.substr(start, keep - start) + L"…";
+                result.push_back(last);
+            } else {
+                result.push_back(text.substr(start));
+            }
+            start = text.size();
+        } else {
+            result.push_back(text.substr(start, end - start));
+            if (end < text.size() && text[end] == L' ') end++;
+            start = end;
+        }
+    }
+    return result;
+}
+
+int WrappedLineCount(const std::wstring& text, int maxChars, int maxLines) {
+    return (int)WrapText(text, maxChars, maxLines).size();
+}
+
 void DrawLabel(Graphics& g, const WCHAR* text, int cx, int cy, float size, int width, const Color& color) {
     if (!width) width = util::Scaled(120);
     Font fn(kFont, size, FontStyleRegular, UnitPixel);
@@ -45,31 +107,55 @@ void DrawLabel(Graphics& g, const WCHAR* text, int cx, int cy, float size, int w
     g.DrawString(text, -1, &fn, rc, &sf, &br);
 }
 
+void DrawWrappedLabel(Graphics& g, const WCHAR* text, int cx, int cy,
+                      float size, int width, const Color& color) {
+    std::vector<std::wstring> lines = WrapText(text ? text : L"",
+                                               kTextCharsPerLine, kTextMaxLines);
+    int lh = (int)(size + util::Scaled(6));
+    int totalH = lh * (int)lines.size();
+    int y0 = cy - totalH / 2;
+    for (size_t i = 0; i < lines.size(); i++) {
+        DrawLabel(g, lines[i].c_str(), cx, y0 + lh * (int)i + lh / 2,
+                  size, width, color);
+    }
+}
+
 void DrawHIcon(Graphics& g, HICON ic, int x, int y, int w, int h) {
     if (!ic) return;
     // FromHICON 会保留图标的 alpha/遮罩通道，透明区域不会出现白底残留
     Bitmap* bmp = Bitmap::FromHICON(ic);
     if (!bmp) return;
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.DrawImage(bmp, x, y, w, h);
     delete bmp;
 }
 
-// 估算文字宽度（中英文混合粗估，够布局用）
-int EstimateTextWidth(const WCHAR* text, int fontSize) {
-    if (!text) return 0;
-    int w = 0;
-    for (const WCHAR* p = text; *p; p++) {
-        if (*p >= 0x4E00 && *p <= 0x9FFF) w += fontSize;       // 中日韩
-        else w += (int)(fontSize * 0.55f);
-    }
-    return w;
+void DrawBitmapIcon(Graphics& g, Bitmap* bmp, int x, int y, int w, int h) {
+    if (!bmp) return;
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.DrawImage(bmp, x, y, w, h);
 }
 
-// 布局用的文字宽度：限制在合理范围内（过长用省略号），避免间距/半径被长名撑大
-int LayoutLabelWidth(const WCHAR* t, int fontSize) {
-    int w = EstimateTextWidth(t, fontSize);
-    int cap = fontSize * 4;          // 显示区域文字宽度封顶（约 4 字宽）
-    return w < cap ? w : cap;
+// 判断位图是否适合作为图标：仅排除全透明/空白位图。
+// 注意：不能根据“黑色”判断占位图，因为自定义 .ico 也可能是黑色图标。
+bool IsUsableIconBitmap(Bitmap* bmp) {
+    if (!bmp) return false;
+    int w = bmp->GetWidth(), h = bmp->GetHeight();
+    if (w <= 0 || h <= 0) return false;
+    int opaque = 0, checked = 0;
+    for (int y = 0; y < h; y += 4) {
+        for (int x = 0; x < w; x += 4) {
+            Color c;
+            if (bmp->GetPixel(x, y, &c) == Ok && c.GetA() > 0) {
+                if (++opaque >= 4) return true;
+            }
+            if (++checked >= 256) break;
+        }
+        if (checked >= 256) break;
+    }
+    return opaque >= 4;
 }
 
 // plate（轴对齐矩形）四个角相对容器中心的最小/最大角（度）。
@@ -160,12 +246,19 @@ void DrawDragBitmap(Graphics& g, int w, int h, const ShortcutEntry& e, int iconS
     FillRounded(g, 0, 0, w, h, util::Scaled(8), Color(190, 255, 255, 255));
     int ix = (w - iconSize) / 2;
     int iy = util::Scaled(4);
-    HICON ic = iconlib::IconForPath(e.path, iconSize);
-    if (ic) {
-        DrawHIcon(g, ic, ix, iy, iconSize, iconSize);
-        DestroyIcon(ic);
+    Bitmap* iconBmp = iconlib::IconBitmapForPath(e.path, iconSize);
+    if (IsUsableIconBitmap(iconBmp)) {
+        DrawBitmapIcon(g, iconBmp, ix, iy, iconSize, iconSize);
+        delete iconBmp;
     } else {
-        DrawFallbackIcon(g, e.name.c_str(), ix, iy, iconSize, iconSize);
+        if (iconBmp) delete iconBmp;
+        HICON ic = iconlib::IconForPath(e.path, iconSize);
+        if (ic) {
+            DrawHIcon(g, ic, ix, iy, iconSize, iconSize);
+            DestroyIcon(ic);
+        } else {
+            DrawFallbackIcon(g, e.name.c_str(), ix, iy, iconSize, iconSize);
+        }
     }
     int ly = iy + iconSize + util::Scaled(4) + util::Scaled(13) / 2;
     int lw = w - util::Scaled(4);
@@ -227,7 +320,9 @@ PanelWindow::PanelWindow(ContainerWindow* owner, const ContainerData& data)
         int vpad = util::Scaled(6), hpad = util::Scaled(8);
         for (size_t i = 0; i < m_centers.size() && i < m_data.shortcuts.size(); i++) {
             int lw = LayoutLabelWidth(m_data.shortcuts[i].name.c_str(), util::Scaled(13));
-            m_plates[i] = PlateRect(m_centers[i], m_iconSize, lw, labelH, vpad, hpad);
+            int lines = WrappedLineCount(m_data.shortcuts[i].name, kTextCharsPerLine, kTextMaxLines);
+            m_plates[i] = PlateRect(m_centers[i], m_iconSize, lw,
+                                    labelH * lines, vpad, hpad);
         }
     }
     Render();
@@ -388,8 +483,9 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
         int maxPlatW = 0, maxPlatH = 0;
         for (int i = 0; i < n; i++) {
             int lw = LayoutLabelWidth(m_data.shortcuts[i].name.c_str(), util::Scaled(13));
+            int lines = WrappedLineCount(m_data.shortcuts[i].name, kTextCharsPerLine, kTextMaxLines);
             int pw = (lw > iconSize ? lw : iconSize) + 2 * hpad;
-            int ph = iconSize + gapV + labelHx + 2 * vpad;
+            int ph = iconSize + gapV + labelHx * lines + 2 * vpad;
             if (pw > maxPlatW) maxPlatW = pw;
             if (ph > maxPlatH) maxPlatH = ph;
         }
@@ -453,11 +549,15 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
     // 条目“实际占用宽度/高度”（图标+文字 plate）
     int wMax = iconSize + 2 * hpad;
     int maxPlatH = iconSize + util::Scaled(6) + labelH + 2 * vpad;
+    int maxLines = 1;
     for (int i = 0; i < nIcons; i++) {
         int lw = LayoutLabelWidth(m_data.shortcuts[i].name.c_str(), font);
         int wItem = (lw > iconSize ? lw : iconSize) + 2 * hpad;
         if (wItem > wMax) wMax = wItem;
+        int lines = WrappedLineCount(m_data.shortcuts[i].name, kTextCharsPerLine, kTextMaxLines);
+        if (lines > maxLines) maxLines = lines;
     }
+    maxPlatH = iconSize + util::Scaled(6) + labelH * maxLines + 2 * vpad;
     int itemStep = wMax + gapArc;              // 相邻图标中心至少需要达到的弦长
     int topInset = iconSize / 2 + vpad;        // plate 上边距（向内）
     int bottomOut = maxPlatH - topInset;       // plate 下边距（向外）
@@ -542,6 +642,27 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
     int Rout = R + bandT / 2;
     int Rin  = R - bandT / 2;
     if (Rin < RinFloor) Rin = RinFloor;
+
+    // 图标+文字的重心比圆心更偏内（文字在图标下方）。
+    // 数量少时把条目中心向外移一点，让图标/文字更居中；
+    // 数量多时不再外移，而是缩小外径，让扇面外边界更贴近条目，减少外侧留白。
+    double itemR = R;
+    double outwardShift = (bottomOut - topInset) / 2.0;
+    if (nIcons >= 4) {
+        outwardShift = 0;
+        int shrinkOuter = (bottomOut - topInset) / 2;
+        if (shrinkOuter > 0) {
+            Rout -= shrinkOuter;
+            int minRout = (int)itemR + bottomOut;
+            if (Rout < minRout) Rout = minRout;
+        }
+    } else if (outwardShift > 0) {
+        double maxShift = Rout - bottomOut - R;
+        if (maxShift < 0) maxShift = 0;
+        if (outwardShift > maxShift) outwardShift = maxShift;
+        itemR += outwardShift;
+    }
+
     m_aDeg = aDeg;   // 记录展开角，供背景绘制保持一致
     if (nIcons == 0) {
         centers.clear();
@@ -561,14 +682,14 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
     if (nIcons == 1) {
         double deg = (m_data.style == ExpandStyle::Ring) ? 0.0 : 270.0;
         double rad = deg * PI / 180.0;
-        centers.push_back({ cex + (int)(R * std::cos(rad)),
-                            cey + (int)(R * std::sin(rad)) });
+        centers.push_back({ cex + (int)(itemR * std::cos(rad)),
+                            cey + (int)(itemR * std::sin(rad)) });
     } else if (m_data.style == ExpandStyle::Ring) {
         for (int i = 0; i < nIcons; i++) {
             double deg = 360.0 * (double)i / (double)nIcons;
             double rad = deg * PI / 180.0;
-            centers.push_back({ cex + (int)(R * std::cos(rad)),
-                                cey + (int)(R * std::sin(rad)) });
+            centers.push_back({ cex + (int)(itemR * std::cos(rad)),
+                                cey + (int)(itemR * std::sin(rad)) });
         }
     } else {
         double boundaryInset = RequiredBoundaryInset(
@@ -580,8 +701,8 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
             double deg = startDeg + boundaryInset +
                          usable * (double)i / (double)(nIcons - 1);
             double rad = deg * PI / 180.0;
-            centers.push_back({ cex + (int)(R * std::cos(rad)),
-                                cey + (int)(R * std::sin(rad)) });
+            centers.push_back({ cex + (int)(itemR * std::cos(rad)),
+                                cey + (int)(itemR * std::sin(rad)) });
         }
     }
 
@@ -628,19 +749,38 @@ void PanelWindow::DrawItem(Graphics& g, int idx, int iconSize,
     // 图标画在 plate 顶部中央
     int ix = plate.left + pw / 2 - iconSize / 2;
     int iy = plate.top + util::Scaled(4);
-    HICON ic = iconlib::IconForPath(e.path, iconSize);
-    if (ic) {
-        DrawHIcon(g, ic, ix, iy, iconSize, iconSize);
-        DestroyIcon(ic);
+    // 图标选择顺序：
+    // 1) UWP 快捷方式 → 使用容器自身图标；
+    // 2) 其他快捷方式 → 使用 IconBitmapForPath（.ico 直接以 GDI+ 位图加载，保留透明通道）；
+    // 3) 失败 → 回退 HICON / 占位图标。
+    Bitmap* iconBmp = nullptr;
+    if (iconlib::IsUwpShortcut(e.path) && m_owner && !m_owner->Data().iconPath.empty())
+        iconBmp = iconlib::IconBitmapForPath(m_owner->Data().iconPath, iconSize);
+    else
+        iconBmp = iconlib::IconBitmapForPath(e.path, iconSize);
+
+    if (IsUsableIconBitmap(iconBmp)) {
+        DrawBitmapIcon(g, iconBmp, ix, iy, iconSize, iconSize);
+        delete iconBmp;
     } else {
-        DrawFallbackIcon(g, e.name.c_str(), ix, iy, iconSize, iconSize);
+        if (iconBmp) delete iconBmp;
+        HICON ic = iconlib::IconForPath(e.path, iconSize);
+        if (ic) {
+            DrawHIcon(g, ic, ix, iy, iconSize, iconSize);
+            DestroyIcon(ic);
+        } else {
+            DrawFallbackIcon(g, e.name.c_str(), ix, iy, iconSize, iconSize);
+        }
     }
-    // 文字画在 plate 下部、居中、宽度限制在 plate 内(省略号)，避免和图标重叠/溢出
+    // 文字画在 plate 下部、居中、宽度限制在 plate 内。
+    // 超过 kTextCharsPerLine 会换行，最多 kTextMaxLines 行，第 3 行末尾省略。
     int labelW = pw - util::Scaled(4);
     int gap = util::Scaled(4);
-    int ly = iy + iconSize + gap + util::Scaled(13) / 2;   // 文字行中心
-    DrawLabel(g, e.name.c_str(), center.x, ly,
-              (REAL)util::Scaled(13), labelW, Color(255, 0x20, 0x20, 0x20));
+    int lines = WrappedLineCount(e.name, kTextCharsPerLine, kTextMaxLines);
+    int labelH = (int)(util::Scaled(13) + util::Scaled(6));
+    int ly = iy + iconSize + gap + labelH * lines / 2;   // 文字块垂直中心
+    DrawWrappedLabel(g, e.name.c_str(), center.x, ly,
+                     (REAL)util::Scaled(13), labelW, Color(255, 0x20, 0x20, 0x20));
 }
 
 void PanelWindow::Draw(Graphics& g, int w, int h) {
@@ -699,15 +839,21 @@ void PanelWindow::DrawPanelBackground(Graphics& g, int w, int h) {
             // 扇形：两侧边为“整条向外弯曲”的贝塞尔弧。
             // 为避免 GraphicsPath 对自交/外凸贝塞尔的填充不完整，
             // 这里采样外弧、外凸侧边、内弧、外凸侧边构成多边形后填充。
-            // 侧边控制点取在内外半径中点，并向外侧偏转 DELTA 角度。
-            // 这样侧边在角度方向上外凸，但半径始终在 [Rin, Rout] 内，
-            // 不会跑到外弧之外形成多余区域。
-            const double DELTA = 0.15;
-            double rMid = (Rout + Rin) / 2.0;
-            PointF cEnd((REAL)(m_cx + rMid * std::cos(eRad + DELTA)),
-                        (REAL)(m_cy + rMid * std::sin(eRad + DELTA)));
-            PointF cStart((REAL)(m_cx + rMid * std::cos(sRad - DELTA)),
-                          (REAL)(m_cy + rMid * std::sin(sRad - DELTA)));
+            // 侧边采用与内外弧相切的三次贝塞尔：控制点沿弧切线方向放置，
+            // 端点处与扇面内外径自然衔接，不出现明显夹角。
+            // 为满足“三段式”，下面把该三次贝塞尔按 t=1/3、2/3 分成三段采样。
+            float sideLen = (float)(Rout - Rin) * 0.5f;
+            // 右侧外凸方向取弧切线方向；左侧外凸方向取弧切线反方向。
+            PointF tEnd((REAL)(-std::sin(eRad)), (REAL)(std::cos(eRad)));
+            PointF tStart((REAL)(std::sin(sRad)), (REAL)(-std::cos(sRad)));
+            PointF cEnd1((REAL)(pex + sideLen * tEnd.X),
+                         (REAL)(pey + sideLen * tEnd.Y));
+            PointF cEnd2((REAL)(iex + sideLen * tEnd.X),
+                         (REAL)(iey + sideLen * tEnd.Y));
+            PointF cStart1((REAL)(isx + sideLen * tStart.X),
+                           (REAL)(isy + sideLen * tStart.Y));
+            PointF cStart2((REAL)(psx + sideLen * tStart.X),
+                           (REAL)(psy + sideLen * tStart.Y));
             PointF pEnd((REAL)pex, (REAL)pey);
             PointF pEndInner((REAL)iex, (REAL)iey);
             PointF pStartInner((REAL)isx, (REAL)isy);
@@ -715,20 +861,23 @@ void PanelWindow::DrawPanelBackground(Graphics& g, int w, int h) {
 
             std::vector<PointF> pts;
             const int ARC_STEPS = 48;
-            const int BEZ_STEPS = 24;
+            const int BEZ_STEPS_PER_SEG = 12;   // 三段式，每段 12 个采样点
             // 外弧：s0 -> e0
             for (int i = 0; i <= ARC_STEPS; i++) {
                 double ang = (s0 + sweep * (double)i / ARC_STEPS) * PI / 180.0;
                 pts.push_back(PointF((REAL)(m_cx + Rout * std::cos(ang)),
                                      (REAL)(m_cy + Rout * std::sin(ang))));
             }
-            // 侧边 1：外弧末端 -> 内弧末端，向外弯
-            for (int i = 0; i <= BEZ_STEPS; i++) {
-                double t = (double)i / BEZ_STEPS;
-                double mt = 1.0 - t;
-                double x = mt*mt*mt*pEnd.X + 3*mt*mt*t*cEnd.X + 3*mt*t*t*cEnd.X + t*t*t*pEndInner.X;
-                double y = mt*mt*mt*pEnd.Y + 3*mt*mt*t*cEnd.Y + 3*mt*t*t*cEnd.Y + t*t*t*pEndInner.Y;
-                pts.push_back(PointF((REAL)x, (REAL)y));
+            // 侧边 1：外弧末端 -> 内弧末端，向外弯（三段式采样）
+            for (int seg = 0; seg < 3; seg++) {
+                double t0 = seg / 3.0, t1 = (seg + 1) / 3.0;
+                for (int i = 0; i <= BEZ_STEPS_PER_SEG; i++) {
+                    double t = t0 + (t1 - t0) * (double)i / BEZ_STEPS_PER_SEG;
+                    double mt = 1.0 - t;
+                    double x = mt*mt*mt*pEnd.X + 3*mt*mt*t*cEnd1.X + 3*mt*t*t*cEnd2.X + t*t*t*pEndInner.X;
+                    double y = mt*mt*mt*pEnd.Y + 3*mt*mt*t*cEnd1.Y + 3*mt*t*t*cEnd2.Y + t*t*t*pEndInner.Y;
+                    pts.push_back(PointF((REAL)x, (REAL)y));
+                }
             }
             // 内弧：e0 -> s0
             for (int i = 0; i <= ARC_STEPS; i++) {
@@ -736,13 +885,16 @@ void PanelWindow::DrawPanelBackground(Graphics& g, int w, int h) {
                 pts.push_back(PointF((REAL)(m_cx + Rin * std::cos(ang)),
                                      (REAL)(m_cy + Rin * std::sin(ang))));
             }
-            // 侧边 2：内弧起点 -> 外弧起点，向外弯
-            for (int i = 0; i <= BEZ_STEPS; i++) {
-                double t = (double)i / BEZ_STEPS;
-                double mt = 1.0 - t;
-                double x = mt*mt*mt*pStartInner.X + 3*mt*mt*t*cStart.X + 3*mt*t*t*cStart.X + t*t*t*pStart.X;
-                double y = mt*mt*mt*pStartInner.Y + 3*mt*mt*t*cStart.Y + 3*mt*t*t*cStart.Y + t*t*t*pStart.Y;
-                pts.push_back(PointF((REAL)x, (REAL)y));
+            // 侧边 2：内弧起点 -> 外弧起点，向外弯（三段式采样）
+            for (int seg = 0; seg < 3; seg++) {
+                double t0 = seg / 3.0, t1 = (seg + 1) / 3.0;
+                for (int i = 0; i <= BEZ_STEPS_PER_SEG; i++) {
+                    double t = t0 + (t1 - t0) * (double)i / BEZ_STEPS_PER_SEG;
+                    double mt = 1.0 - t;
+                    double x = mt*mt*mt*pStartInner.X + 3*mt*mt*t*cStart1.X + 3*mt*t*t*cStart2.X + t*t*t*pStart.X;
+                    double y = mt*mt*mt*pStartInner.Y + 3*mt*mt*t*cStart1.Y + 3*mt*t*t*cStart2.Y + t*t*t*pStart.Y;
+                    pts.push_back(PointF((REAL)x, (REAL)y));
+                }
             }
             SolidBrush br(bg);
             g.FillPolygon(&br, pts.data(), (INT)pts.size());

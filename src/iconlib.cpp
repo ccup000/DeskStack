@@ -7,6 +7,7 @@
 #include <shlwapi.h>
 #include <shlguid.h>
 #include <vector>
+#include <gdiplus.h>
 
 namespace iconlib {
 
@@ -76,6 +77,69 @@ static std::wstring ResolveLnk(const std::wstring& lnk) {
     }
     sl->Release();
     return {};
+}
+
+// 判断 .lnk 是否为 UWP 快捷方式：GetPath 为空且 GetIconLocation 为空。
+bool IsUwpShortcut(const std::wstring& path) {
+    IShellLinkW* sl = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_IShellLinkW, (void**)&sl))) return false;
+    IPersistFile* pf = nullptr;
+    if (FAILED(sl->QueryInterface(IID_IPersistFile, (void**)&pf))) { sl->Release(); return false; }
+    HRESULT hr = pf->Load(path.c_str(), STGM_READ);
+    pf->Release();
+    if (FAILED(hr)) { sl->Release(); return false; }
+    wchar_t target[MAX_PATH] = {};
+    WIN32_FIND_DATAW fd = {};
+    HRESULT hp = sl->GetPath(target, MAX_PATH, &fd, SLGP_RAWPATH);
+    wchar_t iconLoc[MAX_PATH] = {};
+    int iconIdx = 0;
+    HRESULT hi = sl->GetIconLocation(iconLoc, MAX_PATH, &iconIdx);
+    sl->Release();
+    // UWP 快捷方式通常没有目标路径，也没有图标位置
+    if (FAILED(hp) || target[0] == L'\0') {
+        if (FAILED(hi) || iconLoc[0] == L'\0')
+            return true;
+    }
+    return false;
+}
+
+// 从 .lnk 的 IconLocation 直接加载图标（支持 .ico、exe/dll 及资源索引）。
+// 这对“手动修改了显示图标”的快捷方式最可靠。
+static HICON IconFromLnkLocation(const std::wstring& lnkPath, int size) {
+    IShellLinkW* sl = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_IShellLinkW, (void**)&sl))) return nullptr;
+    IPersistFile* pf = nullptr;
+    if (FAILED(sl->QueryInterface(IID_IPersistFile, (void**)&pf))) { sl->Release(); return nullptr; }
+    HRESULT hr = pf->Load(lnkPath.c_str(), STGM_READ);
+    pf->Release();
+    if (FAILED(hr)) { sl->Release(); return nullptr; }
+
+    wchar_t iconLoc[MAX_PATH] = {};
+    int iconIdx = 0;
+    HRESULT hi = sl->GetIconLocation(iconLoc, MAX_PATH, &iconIdx);
+    sl->Release();
+    if (FAILED(hi) || !iconLoc[0]) return nullptr;
+
+    HICON ic = nullptr;
+    // 若指向 .ico，优先直接加载
+    std::wstring loc(iconLoc);
+    std::wstring lower = loc;
+    for (auto& ch : lower) if (ch >= L'A' && ch <= L'Z') ch += (L'a' - L'A');
+    if (lower.size() >= 4 && lower.rfind(L".ico") == lower.size() - 4) {
+        ic = (HICON)LoadImageW(nullptr, iconLoc, IMAGE_ICON,
+                               size, size, LR_LOADFROMFILE | LR_DEFAULTSIZE);
+    }
+    if (!ic) {
+        HICON large = nullptr, smallIcon = nullptr;
+        int n = ExtractIconExW(iconLoc, iconIdx, &large, &smallIcon, 1);
+        if (n > 0 && large) ic = large;
+        else if (n > 0 && smallIcon) ic = smallIcon;
+        else if (large) ic = large;
+        else if (smallIcon) ic = smallIcon;
+    }
+    return ic;
 }
 
 // 从 exe/dll/ico 直接提取内嵌图标（不依赖 shell，更可靠）
@@ -175,14 +239,93 @@ static HICON IconFromShellItemImageFactory(const std::wstring& path, int size) {
     return icon;
 }
 
+// 从 shell 的 IShellItemImageFactory 获取高分辨率 32bpp ARGB 位图。
+// 直接保留 alpha 通道，避免转 HICON 时用单色掩码造成边缘锯齿。
+static Gdiplus::Bitmap* BitmapFromShellItemFactory(const std::wstring& path, int size) {
+    std::wstring norm = path;
+    for (auto& c : norm) if (c == L'/') c = L'\\';
+    IShellItem* item = nullptr;
+    HRESULT hr = SHCreateItemFromParsingName(norm.c_str(), nullptr,
+                                             IID_IShellItem, (void**)&item);
+    if (FAILED(hr) || !item) return nullptr;
+    IShellItemImageFactory* factory = nullptr;
+    hr = item->QueryInterface(IID_IShellItemImageFactory, (void**)&factory);
+    item->Release();
+    if (FAILED(hr) || !factory) return nullptr;
+
+    SIZE sz = { size, size };
+    HBITMAP bmp = nullptr;
+    hr = factory->GetImage(sz, SIIGBF_ICONONLY, &bmp);
+    factory->Release();
+    if (FAILED(hr) || !bmp) return nullptr;
+
+    BITMAP bm = {};
+    if (!GetObjectW(bmp, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) {
+        DeleteObject(bmp);
+        return nullptr;
+    }
+    int w = bm.bmWidth, h = bm.bmHeight;
+
+    HDC hdc = GetDC(nullptr);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    std::vector<BYTE> px((size_t)w * h * 4);
+    int lines = GetDIBits(hdc, bmp, 0, h, px.data(), &bi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, hdc);
+    DeleteObject(bmp);
+    if (lines != h) return nullptr;
+
+    Gdiplus::Bitmap* out = new Gdiplus::Bitmap(w, h, PixelFormat32bppARGB);
+    if (!out) return nullptr;
+    Gdiplus::BitmapData bd;
+    if (out->LockBits(&Gdiplus::Rect(0, 0, w, h),
+                      Gdiplus::ImageLockModeWrite,
+                      PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+        memcpy(bd.Scan0, px.data(), (size_t)w * h * 4);
+        out->UnlockBits(&bd);
+    }
+    return out;
+}
+
+// 从 .lnk 的 IconLocation 直接返回 GDI+ Bitmap（仅支持 .ico，保留 alpha 透明通道）。
+static Gdiplus::Bitmap* BitmapFromLnkIconLocation(const std::wstring& lnkPath) {
+    IShellLinkW* sl = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_IShellLinkW, (void**)&sl))) return nullptr;
+    IPersistFile* pf = nullptr;
+    if (FAILED(sl->QueryInterface(IID_IPersistFile, (void**)&pf))) { sl->Release(); return nullptr; }
+    HRESULT hr = pf->Load(lnkPath.c_str(), STGM_READ);
+    pf->Release();
+    if (FAILED(hr)) { sl->Release(); return nullptr; }
+    wchar_t iconLoc[MAX_PATH] = {};
+    int iconIdx = 0;
+    HRESULT hi = sl->GetIconLocation(iconLoc, MAX_PATH, &iconIdx);
+    sl->Release();
+    if (FAILED(hi) || !iconLoc[0]) return nullptr;
+
+    std::wstring loc(iconLoc);
+    std::wstring lower = loc;
+    for (auto& ch : lower) if (ch >= L'A' && ch <= L'Z') ch += (L'a' - L'A');
+    if (lower.size() >= 4 && lower.rfind(L".ico") == lower.size() - 4)
+        return Gdiplus::Bitmap::FromFile(iconLoc);
+    return nullptr;
+}
+
 HICON IconForPath(const std::wstring& path, int size) {
-    // 1) .lnk：优先通过 shell 项图像工厂取快捷方式实际显示图标。
-    //    对 UWP 快捷方式（GetPath 为空）和手动修改显示图标为 .ico 的快捷方式，
-    //    这种方式比 SHGetFileInfo/解析目标更可靠。
+    // 1) .lnk：
+    //    优先读取快捷方式 IconLocation 直接加载（手动指定 .ico/exe 时最准确）；
+    //    其次 SHGetFileInfo；最后才用 IShellItemImageFactory（UWP 可能返回黑色占位图）。
     if (desktop::IsLnk(path)) {
-        HICON ic = IconFromShellItemImageFactory(path, size);
+        HICON ic = IconFromLnkLocation(path, size);
         if (ic) return ic;
         ic = ShellIcon(path, size);
+        if (ic) return ic;
+        ic = IconFromShellItemImageFactory(path, size);
         if (ic) return ic;
         // 快捷方式自身图标取不到时，再解析真实目标，从目标本身取图标
         std::wstring target = ResolveLnk(path);
@@ -227,6 +370,39 @@ HICON IconForPath(const std::wstring& path, int size) {
     HICON fallback = DefaultIcon(size);
     if (fallback) return fallback;
     return CreateDummyIcon(size);
+}
+
+Gdiplus::Bitmap* IconBitmapForPath(const std::wstring& path, int size) {
+    // .lnk 若指定了 .ico 图标，直接用 GDI+ 加载该 .ico，保留透明通道。
+    if (desktop::IsLnk(path)) {
+        Gdiplus::Bitmap* icoBmp = BitmapFromLnkIconLocation(path);
+        if (icoBmp) return icoBmp;
+
+        // 其他 .lnk 优先走 HICON 路径，以便尊重快捷方式自定义图标；
+        // shell 工厂对 UWP/自定义 .ico 快捷方式可能返回黑色占位图，不能作为 .lnk 首选。
+        HICON ic = IconForPath(path, size);
+        if (ic) {
+            Gdiplus::Bitmap* out = Gdiplus::Bitmap::FromHICON(ic);
+            DestroyIcon(ic);
+            if (out) return out;
+        }
+    }
+
+    // 非 .lnk 或 .lnk 走 HICON 失败时，再请求高分辨率 shell 位图。
+    int hiSize = size * 2;
+    if (hiSize < 96) hiSize = 96;
+    if (hiSize > 256) hiSize = 256;
+    Gdiplus::Bitmap* bmp = BitmapFromShellItemFactory(path, hiSize);
+    if (bmp) return bmp;
+
+    // 最后再回退一次 HICON 路径
+    HICON ic = IconForPath(path, size);
+    if (ic) {
+        Gdiplus::Bitmap* out = Gdiplus::Bitmap::FromHICON(ic);
+        DestroyIcon(ic);
+        return out;
+    }
+    return nullptr;
 }
 
 } // namespace iconlib

@@ -69,8 +69,38 @@ void DrawHIcon(Graphics& g, HICON ic, int x, int y, int w, int h) {
     // FromHICON 会保留图标的 alpha/遮罩通道，透明区域不会出现白底残留
     Bitmap* bmp = Bitmap::FromHICON(ic);
     if (!bmp) return;
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.DrawImage(bmp, x, y, w, h);
     delete bmp;
+}
+
+void DrawBitmapIcon(Graphics& g, Bitmap* bmp, int x, int y, int w, int h) {
+    if (!bmp) return;
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.DrawImage(bmp, x, y, w, h);
+}
+
+// 判断位图是否为空/全透明；全透明时不能作为可见图标，应回退到默认图标。
+bool IsBitmapVisible(Bitmap* bmp) {
+    if (!bmp) return false;
+    int w = bmp->GetWidth(), h = bmp->GetHeight();
+    if (w <= 0 || h <= 0) return false;
+    // 采样一部分像素即可，不必逐像素扫描，节省绘制时间。
+    int step = std::max(1, (w * h) / 400);
+    int checked = 0, nonzero = 0;
+    for (int y = 0; y < h; y += 4) {
+        for (int x = 0; x < w; x += 4) {
+            Color c;
+            if (bmp->GetPixel(x, y, &c) == Ok && c.GetA() > 0) {
+                if (++nonzero >= 8) return true;
+            }
+            if (++checked >= 400) break;
+        }
+        if (checked >= 400) break;
+    }
+    return nonzero >= 8;
 }
 
 // 图标解析失败时绘制可见占位块
@@ -343,6 +373,8 @@ void ContainerWindow::ReapplyPosition() {
     // 同时更新为桌面单元格尺寸，保证网格对齐（不随 DPI/图标大小变化而偏移）
     SetWindowPos(m_hwnd, HWND_TOP, x, y, (int)cw, (int)ch,
                  SWP_NOACTIVATE);
+    // 给容器设置矩形命中区域，避免透明区域导致 WindowFromPoint/鼠标点击穿透。
+    SetWindowRgn(m_hwnd, CreateRectRgn(0, 0, (int)cw, (int)ch), TRUE);
     // 确保宿主可用后容器可见（解决：启动时宿主未就绪导致一直隐藏）
     if (!IsWindowVisible(m_hwnd)) ShowWindow(m_hwnd, SW_SHOW);
     Render();
@@ -379,15 +411,22 @@ void ContainerWindow::Render() {
         [&](Graphics& g, int ww, int hh) {
             g.Clear(Color(0, 0, 0, 0));
             int icon = desktop::DesktopIconSize();   // 按桌面实际图标尺寸绘制，与系统桌面图标一致
-            HICON ic = m_data.iconPath.empty()
-                ? iconlib::DefaultIcon(icon)
-                : iconlib::IconForPath(m_data.iconPath, icon);
             int x = (ww - icon) / 2, y = util::Scaled(6);
-            if (ic) {
-                DrawHIcon(g, ic, x, y, icon, icon);
-                DestroyIcon(ic);
+            Bitmap* iconBmp = iconlib::IconBitmapForPath(m_data.iconPath, icon);
+            if (iconBmp && IsBitmapVisible(iconBmp)) {
+                DrawBitmapIcon(g, iconBmp, x, y, icon, icon);
+                delete iconBmp;
             } else {
-                DrawFallbackIcon(g, m_data.name.c_str(), x, y, icon, icon);
+                if (iconBmp) delete iconBmp;
+                HICON ic = m_data.iconPath.empty()
+                    ? iconlib::DefaultIcon(icon)
+                    : iconlib::IconForPath(m_data.iconPath, icon);
+                if (ic) {
+                    DrawHIcon(g, ic, x, y, icon, icon);
+                    DestroyIcon(ic);
+                } else {
+                    DrawFallbackIcon(g, m_data.name.c_str(), x, y, icon, icon);
+                }
             }
             // 标签：白色 + 黑色阴影，字号与桌面图标一致（12px）。
             // 文本限制在容器窗口内（桌面网格单元格宽度），超长省略，避免越界。
@@ -465,6 +504,9 @@ void ContainerWindow::AddShortcut(const std::wstring& srcPath) {
 LRESULT CALLBACK ContainerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     ContainerWindow* self = (ContainerWindow*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     switch (msg) {
+        case WM_NCHITTEST:
+            // 分层窗口透明区域也视为可点击，避免容器空白处被桌面穿透。
+            return HTCLIENT;
         case WM_DROPFILES: {
             if (!self) break;
             HDROP drop = (HDROP)wp;
