@@ -17,6 +17,7 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <algorithm>
+#include <cmath>
 
 using namespace Gdiplus;
 
@@ -39,10 +40,37 @@ std::wstring NameNoExt(const std::wstring& path) {
     return base;
 }
 
+// 把网格索引收敛到“宿主客户区在工作区内可见”的范围内。
+// 桌面图标列表的客户区原点/尺寸可能与工作区不完全重合，因此把宿主的 (0,0)
+// 换算到屏幕坐标后再计算可见的 col/row 区间，避免容器被保存到屏幕外。
+void ClampGridToWorkArea(HWND host, int cw, int ch, int& col, int& row) {
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    POINT origin{ 0, 0 };
+    MapWindowPoints(host, nullptr, &origin, 1);
+
+    int colMin = (int)std::ceil((double)(wa.left - origin.x) / cw);
+    int rowMin = (int)std::ceil((double)(wa.top - origin.y) / ch);
+    int colMax = (int)std::floor((double)(wa.right - cw - origin.x) / cw);
+    int rowMax = (int)std::floor((double)(wa.bottom - ch - origin.y) / ch);
+    if (colMin < 0) colMin = 0;
+    if (rowMin < 0) rowMin = 0;
+    if (colMax < colMin) colMax = colMin;
+    if (rowMax < rowMin) rowMax = rowMin;
+
+    if (col < colMin) col = colMin;
+    if (col > colMax) col = colMax;
+    if (row < rowMin) row = rowMin;
+    if (row > rowMax) row = rowMax;
+}
+
 void DrawHIcon(Graphics& g, HICON ic, int x, int y, int w, int h) {
     if (!ic) return;
-    Bitmap bmp(ic);              // 由 HICON 复制为 GDI+ 位图
-    g.DrawImage(&bmp, x, y, w, h);
+    // FromHICON 会保留图标的 alpha/遮罩通道，透明区域不会出现白底残留
+    Bitmap* bmp = Bitmap::FromHICON(ic);
+    if (!bmp) return;
+    g.DrawImage(bmp, x, y, w, h);
+    delete bmp;
 }
 
 // 图标解析失败时绘制可见占位块
@@ -94,10 +122,11 @@ public:
     STDMETHOD(DragEnter)(IDataObject* pDataObj, DWORD, POINTL, DWORD* pdwEffect) {
         if (!pDataObj) { m_over = false; *pdwEffect = DROPEFFECT_NONE; return S_OK; }
         FORMATETC st = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        FORMATETC stShell = { (CLIPFORMAT)s_cfShellIdList, nullptr,
+                              DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
         m_over = (pDataObj->QueryGetData(&st) == S_OK) ||
                  (s_cfShellIdList &&
-                  pDataObj->QueryGetData(&FORMATETC{ (CLIPFORMAT)s_cfShellIdList, nullptr,
-                                                     DVASPECT_CONTENT, -1, TYMED_HGLOBAL }) == S_OK);
+                  pDataObj->QueryGetData(&stShell) == S_OK);
         *pdwEffect = m_over ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
         if (m_over) {
             auto* self = (ContainerWindow*)GetWindowLongPtrW(m_hwnd, GWLP_USERDATA);
@@ -250,13 +279,18 @@ ContainerWindow::ContainerWindow(const ContainerData& data) : m_data(data) {
     HWND host = desktop::FindDesktopListView();
     int w = util::Scaled(113), h = util::Scaled(103);
 
-    // 计算初始位置（网格索引 × 单元格）
+    // 计算初始位置与尺寸（网格索引 × 单元格）。
+    // 容器窗口尺寸取桌面网格单元格大小，这样图标/文字在单元格内居中，
+    // 与桌面“图标与网格对齐”时的其他图标保持一致。
     POINT pt{ 0, 0 };
     if (host) {
         WORD cw = 0, ch = 0;
         if (desktop::GetCellSize(cw, ch) && cw > 0 && ch > 0) {
-            pt.x = m_data.col * (int)(cw + ch * 0); // 占位，下面统一计算
+            ClampGridToWorkArea(host, (int)cw, (int)ch, m_data.col, m_data.row);
+            pt.x = m_data.col * (int)cw;
             pt.y = m_data.row * (int)ch;
+            w = (int)cw;
+            h = (int)ch;
         }
     }
 
@@ -302,11 +336,16 @@ void ContainerWindow::ReapplyPosition() {
     if (!host) return;
     WORD cw = 0, ch = 0;
     if (!desktop::GetCellSize(cw, ch) || cw <= 0 || ch <= 0) return;
+    // 若保存的网格索引在工作区之外（例如旧配置 row 过大），先拉回可见范围
+    ClampGridToWorkArea(host, (int)cw, (int)ch, m_data.col, m_data.row);
     int x = m_data.col * (int)cw;
     int y = m_data.row * (int)ch;
-    SetWindowPos(m_hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    // 同时更新为桌面单元格尺寸，保证网格对齐（不随 DPI/图标大小变化而偏移）
+    SetWindowPos(m_hwnd, HWND_TOP, x, y, (int)cw, (int)ch,
+                 SWP_NOACTIVATE);
     // 确保宿主可用后容器可见（解决：启动时宿主未就绪导致一直隐藏）
     if (!IsWindowVisible(m_hwnd)) ShowWindow(m_hwnd, SW_SHOW);
+    Render();
 }
 
 void ContainerWindow::SetGridIndex(int col, int row) {
@@ -339,7 +378,7 @@ void ContainerWindow::Render() {
     layered::Present(m_hwnd, w, h, wr.left, wr.top,
         [&](Graphics& g, int ww, int hh) {
             g.Clear(Color(0, 0, 0, 0));
-            int icon = desktop::IconSize();   // 按系统实际图标尺寸绘制，避免放大
+            int icon = desktop::DesktopIconSize();   // 按桌面实际图标尺寸绘制，与系统桌面图标一致
             HICON ic = m_data.iconPath.empty()
                 ? iconlib::DefaultIcon(icon)
                 : iconlib::IconForPath(m_data.iconPath, icon);
@@ -350,13 +389,19 @@ void ContainerWindow::Render() {
             } else {
                 DrawFallbackIcon(g, m_data.name.c_str(), x, y, icon, icon);
             }
-            // 标签：白色 + 黑色阴影，字号与桌面图标一致（12px）
+            // 标签：白色 + 黑色阴影，字号与桌面图标一致（12px）。
+            // 文本限制在容器窗口内（桌面网格单元格宽度），超长省略，避免越界。
             Font fn(kFont, (REAL)util::Scaled(12), FontStyleRegular, UnitPixel);
             StringFormat sf;
             sf.SetAlignment(StringAlignmentCenter);
             sf.SetLineAlignment(StringAlignmentCenter);
+            sf.SetTrimming(StringTrimmingEllipsisCharacter);
             int cy = y + icon + util::Scaled(8);
-            RectF rcTxt((float)((ww - 200) / 2), (float)(cy - 9), 200.0f, 18.0f);
+            int labelW = ww - util::Scaled(4);
+            if (labelW < util::Scaled(20)) labelW = util::Scaled(20);
+            int labelH = util::Scaled(18);
+            RectF rcTxt((float)((ww - labelW) / 2), (float)(cy - labelH / 2),
+                        (float)labelW, (float)labelH);
             SolidBrush sh(Color(180, 0, 0, 0));
             RectF rcSh(rcTxt); rcSh.X += 1; rcSh.Y += 1;
             g.DrawString(m_data.name.c_str(), -1, &fn, rcSh, &sf, &sh);
@@ -477,6 +522,8 @@ LRESULT CALLBACK ContainerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
                     POINT p = desktop::ScreenToClientOf(host, { rc.left, rc.top });
                     int col = (int)((double)p.x / cw + 0.499);
                     int row = (int)((double)p.y / ch + 0.499);
+                    // 拖拽释放也收敛到工作区可见网格内，避免保存/显示到屏幕外
+                    ClampGridToWorkArea(host, (int)cw, (int)ch, col, row);
                     SetWindowPos(hwnd, HWND_TOP, col * (int)cw, row * (int)ch,
                                  0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
                     self->SetGridIndex(col, row);

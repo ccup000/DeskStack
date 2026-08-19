@@ -25,8 +25,7 @@ add_executable(DeskStack WIN32
 target_include_directories(DeskStack PRIVATE src src/thirdparty)
 
 # 合并应用 manifest（Per-Monitor V2 + 兼容 Win8 以支持 WS_EX_LAYERED 子窗口）
-target_link_options(DeskStack PRIVATE
-    "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/src/app.manifest")
+target_sources(DeskStack PRIVATE src/app.manifest)
 
 target_link_libraries(DeskStack PRIVATE
     user32 gdi32 gdiplus ole32 oleaut32 shell32 shlwapi comctl32 comdlg32 uuid

@@ -31,6 +31,12 @@ private:
     void Draw(Gdiplus::Graphics& g, int w, int h);
     void DrawPanelBackground(Gdiplus::Graphics& g, int w, int h);
 
+    // 拖动容器内条目到桌面
+    void DragStart(int idx, POINT clientPt);
+    void DragMove(POINT screenPt);
+    void DragEnd(POINT screenPt);      // 在屏幕坐标释放
+    void DragCancel();
+
     HWND m_hwnd = nullptr;
     ContainerWindow* m_owner = nullptr;
     ContainerData m_data;               // 快照：面板打开时的样式与条目
@@ -46,4 +52,11 @@ private:
     int m_labelW = 0;      // 条目文字绘制宽度（受限于单元格，防溢出重叠）
     int m_windowX = 0, m_windowY = 0;   // 窗口屏幕位置
     int m_windowW = 0, m_windowH = 0;   // 窗口客户端尺寸
+
+    // 拖出到桌面状态
+    bool   m_draggingOut = false;
+    bool   m_inDragDrop = false;    // DragEnd 临时隐藏面板时，避免 WA_INACTIVE 误关
+    int    m_dragIdx = -1;
+    POINT  m_downPt{};
+    HWND   m_dragWnd = nullptr;
 };

@@ -24,8 +24,15 @@ bool GetCellSize(WORD& cellW, WORD& cellH);
 // 图标应以此为原生大小绘制，避免被放大失真。
 int IconSize();
 
+// 桌面实际使用的图标尺寸（来自 Shell Bags，受桌面右键“查看”影响）。
+// 用于悬浮容器自身图标，使其与系统桌面图标大小一致。
+int DesktopIconSize();
+
 // 把屏幕坐标点换算成某窗口的客户区坐标
 POINT ScreenToClientOf(HWND hwnd, POINT pt);
+
+// 判断窗口是否为桌面/桌面图标列表窗口（含其父链）
+bool IsDesktopWindow(HWND hwnd);
 
 // 桌面文件夹路径
 std::wstring DesktopFolder();

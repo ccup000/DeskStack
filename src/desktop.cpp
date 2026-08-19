@@ -1,9 +1,11 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "desktop.h"
+#include "types.h"
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <shlguid.h>
+#include <winreg.h>
 #include <vector>
 
 namespace desktop {
@@ -65,11 +67,26 @@ HWND FindDesktopListView() {
 bool GetCellSize(WORD& cellW, WORD& cellH) {
     HWND lv = FindDesktopListView();
     if (!lv) return false;
-    LRESULT r = SendMessageW(lv, LVM_GETITEMSPACING, TRUE, 0);
+    // fSmall=FALSE：桌面是大图标视图；TRUE 会取小图标视图的间距，
+    // 导致容器与桌面“图标与网格对齐”时的网格不一致。
+    LRESULT r = SendMessageW(lv, LVM_GETITEMSPACING, FALSE, 0);
     if ((int)r == 0) return false;
     cellW = LOWORD(r);
     cellH = HIWORD(r);
     return true;
+}
+
+bool IsDesktopWindow(HWND hwnd) {
+    for (HWND h = hwnd; h; h = GetParent(h)) {
+        wchar_t cls[64] = {};
+        if (!GetClassNameW(h, cls, 64)) continue;
+        if (_wcsicmp(cls, L"SysListView32") == 0 ||
+            _wcsicmp(cls, L"SHELLDLL_DefView") == 0 ||
+            _wcsicmp(cls, L"Progman") == 0 ||
+            _wcsicmp(cls, L"WorkerW") == 0)
+            return true;
+    }
+    return false;
 }
 
 POINT ScreenToClientOf(HWND hwnd, POINT pt) {
@@ -83,6 +100,19 @@ int IconSize() {
     return s;
 }
 
+int DesktopIconSize() {
+    // 桌面实际图标大小来自 Shell Bags（受桌面右键“查看”影响），
+    // SM_CXICON 只反映系统小图标大小，不能代表桌面图标大小。
+    DWORD iconSize = 0, sizeBytes = sizeof(iconSize);
+    if (RegGetValueW(HKEY_CURRENT_USER,
+                     L"Software\\Microsoft\\Windows\\Shell\\Bags\\1\\Desktop",
+                     L"IconSize", RRF_RT_REG_DWORD, nullptr,
+                     &iconSize, &sizeBytes) == ERROR_SUCCESS &&
+        iconSize >= 16 && iconSize <= 512) {
+        return (int)(iconSize * util::DpiScale() + 0.5f);
+    }
+    return IconSize();
+}
 std::wstring DesktopFolder() {
     wchar_t desktop[MAX_PATH] = {};
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, 0, desktop)))

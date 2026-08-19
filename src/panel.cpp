@@ -47,8 +47,11 @@ void DrawLabel(Graphics& g, const WCHAR* text, int cx, int cy, float size, int w
 
 void DrawHIcon(Graphics& g, HICON ic, int x, int y, int w, int h) {
     if (!ic) return;
-    Bitmap bmp(ic);
-    g.DrawImage(&bmp, x, y, w, h);
+    // FromHICON 会保留图标的 alpha/遮罩通道，透明区域不会出现白底残留
+    Bitmap* bmp = Bitmap::FromHICON(ic);
+    if (!bmp) return;
+    g.DrawImage(bmp, x, y, w, h);
+    delete bmp;
 }
 
 // 估算文字宽度（中英文混合粗估，够布局用）
@@ -67,6 +70,44 @@ int LayoutLabelWidth(const WCHAR* t, int fontSize) {
     int w = EstimateTextWidth(t, fontSize);
     int cap = fontSize * 4;          // 显示区域文字宽度封顶（约 4 字宽）
     return w < cap ? w : cap;
+}
+
+// plate（轴对齐矩形）四个角相对容器中心的最小/最大角（度）。
+// 使用相对中心角的差值归一化到 [-180,180]，避免 0°/360° 跳变导致的范围计算错误。
+void PlateAngularRange(double R, double thetaDeg, double halfW,
+                       double topInset, double bottomOut,
+                       double& minDeg, double& maxDeg) {
+    const double PI = 3.141592653589793;
+    double th = thetaDeg * PI / 180.0;
+    double cx = R * std::cos(th);
+    double cy = R * std::sin(th);
+    double xs[4] = { cx - halfW, cx + halfW, cx - halfW, cx + halfW };
+    double ys[4] = { cy - topInset, cy - topInset, cy + bottomOut, cy + bottomOut };
+    minDeg = 360.0;
+    maxDeg = -360.0;
+    for (int i = 0; i < 4; i++) {
+        double ang = std::atan2(ys[i], xs[i]) * 180.0 / PI;
+        double rel = ang - thetaDeg;
+        while (rel > 180.0) rel -= 360.0;
+        while (rel < -180.0) rel += 360.0;
+        double absDeg = thetaDeg + rel;
+        if (absDeg < minDeg) minDeg = absDeg;
+        if (absDeg > maxDeg) maxDeg = absDeg;
+    }
+}
+
+// 为使首条 plate 不越过扇形起始边 startDeg，中心需要向内的最小角向偏移
+double RequiredBoundaryInset(double R, double startDeg, double halfW,
+                             double topInset, double bottomOut) {
+    double lo = 0.0, hi = 90.0;
+    for (int i = 0; i < 60; i++) {
+        double mid = (lo + hi) / 2.0;
+        double mn = 0.0, mx = 0.0;
+        PlateAngularRange(R, startDeg + mid, halfW, topInset, bottomOut, mn, mx);
+        if (mn >= startDeg - 1e-6) hi = mid;
+        else lo = mid;
+    }
+    return hi;
 }
 
 // 由图标中心求出“实际区域”（图标+文字包围盒）
@@ -108,6 +149,31 @@ void DrawFallbackIcon(Graphics& g, const WCHAR* text, int x, int y, int w, int h
     }
 }
 
+// ── 拖动条目到桌面时的半透明拖影窗口 ─────────────────────────────
+LRESULT CALLBACK DragImageWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;   // 鼠标穿透，不抢焦点
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void DrawDragBitmap(Graphics& g, int w, int h, const ShortcutEntry& e, int iconSize) {
+    // 拖影：圆角半透明底 + 图标 + 文字，跟随后续鼠标移动
+    FillRounded(g, 0, 0, w, h, util::Scaled(8), Color(190, 255, 255, 255));
+    int ix = (w - iconSize) / 2;
+    int iy = util::Scaled(4);
+    HICON ic = iconlib::IconForPath(e.path, iconSize);
+    if (ic) {
+        DrawHIcon(g, ic, ix, iy, iconSize, iconSize);
+        DestroyIcon(ic);
+    } else {
+        DrawFallbackIcon(g, e.name.c_str(), ix, iy, iconSize, iconSize);
+    }
+    int ly = iy + iconSize + util::Scaled(4) + util::Scaled(13) / 2;
+    int lw = w - util::Scaled(4);
+    if (lw < util::Scaled(20)) lw = util::Scaled(20);
+    DrawLabel(g, e.name.c_str(), w / 2, ly, (REAL)util::Scaled(13), lw,
+              Color(255, 0x20, 0x20, 0x20));
+}
+
 } // namespace
 
 void PanelWindow::RegisterClass(HINSTANCE hInst) {
@@ -117,6 +183,14 @@ void PanelWindow::RegisterClass(HINSTANCE hInst) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = L"DeskStackPanel";
     RegisterClassExW(&wc);
+
+    // 拖出条目时显示的拖影窗口（半透明、鼠标穿透）
+    WNDCLASSEXW dwc = { sizeof(dwc) };
+    dwc.lpfnWndProc = DragImageWndProc;
+    dwc.hInstance = hInst;
+    dwc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    dwc.lpszClassName = L"DeskStackDragImage";
+    RegisterClassExW(&dwc);
 }
 
 PanelWindow::PanelWindow(ContainerWindow* owner, const ContainerData& data)
@@ -163,12 +237,107 @@ PanelWindow::PanelWindow(ContainerWindow* owner, const ContainerData& data)
 }
 
 PanelWindow::~PanelWindow() {
+    if (m_dragWnd && IsWindow(m_dragWnd)) DestroyWindow(m_dragWnd);
+    m_dragWnd = nullptr;
     if (m_hwnd && IsWindow(m_hwnd)) DestroyWindow(m_hwnd);
     m_hwnd = nullptr;
     if (m_owner) m_owner->m_panel = nullptr;
 }
 
 void PanelWindow::Close() { if (m_hwnd) DestroyWindow(m_hwnd); }
+
+void PanelWindow::DragStart(int idx, POINT clientPt) {
+    if (idx < 0 || (size_t)idx >= m_data.shortcuts.size()) return;
+    m_draggingOut = true;
+    m_dragIdx = idx;
+    m_downPt = clientPt;
+
+    int w = util::Scaled(96), h = util::Scaled(88);
+    if ((size_t)idx < m_plates.size()) {
+        const RECT& plate = m_plates[idx];
+        w = plate.right - plate.left;
+        h = plate.bottom - plate.top;
+    }
+    if (w < util::Scaled(48)) w = util::Scaled(48);
+    if (h < util::Scaled(48)) h = util::Scaled(48);
+
+    POINT cur; GetCursorPos(&cur);
+    m_dragWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
+                                WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                                L"DeskStackDragImage", L"", WS_POPUP,
+                                cur.x - w / 2, cur.y - h / 2, w, h,
+                                nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (m_dragWnd) {
+        RECT wr; GetWindowRect(m_dragWnd, &wr);
+        int ww = wr.right - wr.left, hh = wr.bottom - wr.top;
+        layered::Present(m_dragWnd, ww, hh, wr.left, wr.top,
+            [&](Graphics& g, int ww2, int hh2) {
+                DrawDragBitmap(g, ww2, hh2, m_data.shortcuts[idx], m_iconSize);
+            }, 190);
+        ShowWindow(m_dragWnd, SW_SHOW);
+    }
+    SetCursor(LoadCursorW(nullptr, IDC_HAND));
+}
+
+void PanelWindow::DragMove(POINT screenPt) {
+    if (!m_dragWnd) return;
+    RECT rc; GetWindowRect(m_dragWnd, &rc);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    SetWindowPos(m_dragWnd, HWND_TOPMOST, screenPt.x - w / 2, screenPt.y - h / 2,
+                 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void PanelWindow::DragCancel() {
+    if (m_dragWnd) { DestroyWindow(m_dragWnd); m_dragWnd = nullptr; }
+    m_draggingOut = false;
+    m_dragIdx = -1;
+}
+
+void PanelWindow::DragEnd(POINT screenPt) {
+    if (m_dragWnd) { DestroyWindow(m_dragWnd); m_dragWnd = nullptr; }
+
+    bool dropped = false;
+    int idx = m_dragIdx;
+    if (idx >= 0 && (size_t)idx < m_data.shortcuts.size()) {
+        // 暂时隐藏面板，以便 WindowFromPoint 取到桌面/桌面图标列表窗口。
+        // 隐藏/释放捕获可能会触发 WM_CAPTURECHANGED 从而修改 m_dragIdx，
+        // 因此后续一律使用局部 idx，避免索引失效。
+        m_inDragDrop = true;
+        if (m_hwnd && IsWindow(m_hwnd)) ShowWindow(m_hwnd, SW_HIDE);
+        HWND under = WindowFromPoint(screenPt);
+        m_inDragDrop = false;
+        if (under && desktop::IsDesktopWindow(under)) {
+            const ShortcutEntry& e = m_data.shortcuts[idx];
+            std::wstring target = e.path;
+            if (e.type == "lnk") {
+                std::wstring t = desktop::LnkTarget(e.path);
+                if (!t.empty()) target = t;
+            }
+            if (desktop::CreateDesktopShortcut(e.name, target)) {
+                if (m_owner) {
+                    auto& sc = m_owner->Data().shortcuts;
+                    if (idx >= 0 && (size_t)idx < sc.size()) {
+                        sc.erase(sc.begin() + idx);
+                    }
+                    m_owner->Render();
+                    Config::MarkDirty();
+                }
+                dropped = true;
+            }
+        }
+    }
+
+    m_draggingOut = false;
+    m_dragIdx = -1;
+    if (dropped) {
+        Close();   // 成功拖到桌面：关闭面板
+    } else if (m_hwnd && IsWindow(m_hwnd)) {
+        // 未放到桌面：恢复面板
+        ShowWindow(m_hwnd, SW_SHOW);
+        SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
 
 void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
     int n = (int)m_data.shortcuts.size();
@@ -270,69 +439,109 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
         return;
     }
 
-    // Fan / Ring：扇面宽度(=外-内)固定，外/内半径按图标数量动态调整
-    // 目标：均匀分布、不超出区域
+    // Fan / Ring：扇面宽度(=外-内)固定，外/内半径按图标数量动态调整。
+    // 目标：均匀分布、不超出区域、紧凑优先、仅在放不下时放大半径。
     iconSize = desktop::IconSize();
     int nIcons = n;
 
-    // 固定扇带厚度（设计值 260-140=120 逻辑像素）
-    int bandT = util::Scaled(260) - util::Scaled(140);
-    if (bandT < util::Scaled(40)) bandT = util::Scaled(40);
+    int font = util::Scaled(13);
+    int labelH = font + util::Scaled(6);
+    int vpad = util::Scaled(6);
+    int hpad = util::Scaled(8);
+    int gapArc = util::Scaled(5);
 
-    // 条目“实际占用宽度”（图标+文字 plate 宽度）
-    int hpad = util::Scaled(8), gapArc = util::Scaled(5);
-    int wMax = 0;
+    // 条目“实际占用宽度/高度”（图标+文字 plate）
+    int wMax = iconSize + 2 * hpad;
+    int maxPlatH = iconSize + util::Scaled(6) + labelH + 2 * vpad;
     for (int i = 0; i < nIcons; i++) {
-        int lw = LayoutLabelWidth(m_data.shortcuts[i].name.c_str(), util::Scaled(13));
+        int lw = LayoutLabelWidth(m_data.shortcuts[i].name.c_str(), font);
         int wItem = (lw > iconSize ? lw : iconSize) + 2 * hpad;
         if (wItem > wMax) wMax = wItem;
     }
-    if (wMax < iconSize + 2 * hpad) wMax = iconSize + 2 * hpad;
-    double neededArc = (double)nIcons * (wMax + gapArc);   // 铺开所需总弧长
+    int itemStep = wMax + gapArc;              // 相邻图标中心至少需要达到的弦长
+    int topInset = iconSize / 2 + vpad;        // plate 上边距（向内）
+    int bottomOut = maxPlatH - topInset;       // plate 下边距（向外）
 
-    // 屏幕约束（最大外层半径）
+    // 固定扇带厚度（设计值 260-140=120 逻辑像素），仅当条目高度放不下时才放宽
+    int bandT = util::Scaled(260) - util::Scaled(140);
+    int minBand = 2 * std::max(topInset, bottomOut) + util::Scaled(8);
+    if (bandT < minBand) bandT = minBand;
+
+    // 屏幕约束（最大外层半径）：面板直径约为 2*Rout，尽量占满工作区短边，
+    // 但留出窗口边距；这样“放不下才放大半径”时能利用更多屏幕空间，减少末端重叠。
     RECT wa2; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa2, 0);
-    int halfDiag = (int)(std::min(wa2.right - wa2.left, wa2.bottom - wa2.top) * 0.40f);
+    int halfDiag = (int)(std::min(wa2.right - wa2.left, wa2.bottom - wa2.top) * 0.50f)
+                   - util::Scaled(4);
+    if (halfDiag < util::Scaled(60)) halfDiag = util::Scaled(60);
 
-    // 紧凑优先：从一个小半径开始，仅当放不下时才逐步放大半径
     const double PI = 3.141592653589793;
     int compactR0 = util::Scaled(120);
     int RinFloor  = util::Scaled(40);
-    double aDeg = (m_data.style == ExpandStyle::Ring) ? 360.0 : 60.0;  // 默认最小角
+    int Rmax = halfDiag - bandT / 2;          // 外层不超出屏幕
+    int Rmin = RinFloor + bandT / 2;          // 内镂空不小于最小值
+    if (Rmax < Rmin) Rmax = Rmin;
 
     int R = compactR0;
+    double aDeg = 360.0;
+
     if (m_data.style == ExpandStyle::Ring) {
-        // 环形：直接按“不重叠”所需半径（用弦长更准确）计算，但要优先紧凑
-        double needArcR  = neededArc / (2.0 * PI);                       // 按弧长
-        double needChordR = (nIcons > 1) ? (wMax + gapArc) / (2.0 * std::sin(PI / (double)nIcons)) : 0.0; // 按相邻弦长
-        double need = needArcR > needChordR ? needArcR : needChordR;
-        R = (int)(need + 0.5);
+        // 环形：按“不重叠”所需半径计算（弦长优先），但保持紧凑半径下限
+        double needR = compactR0;
+        if (nIcons > 1) {
+            double chordNeed = itemStep / (2.0 * std::sin(PI / (double)nIcons));
+            double arcNeed = (double)nIcons * itemStep / (2.0 * PI);
+            needR = std::max(chordNeed, arcNeed);
+        }
+        R = (int)(needR + 0.5);
+        if (R < Rmin) R = Rmin;
         if (R < compactR0) R = compactR0;
-        if (R > halfDiag) R = halfDiag;
+        if (R > Rmax) R = Rmax;
+        aDeg = 360.0;
     } else {
-        // 扇形：均匀铺开在 [60°,180°]，从紧凑半径起，放不下才放大
+        // 扇形：紧凑优先。最小 60°，最大 180°。
+        // 两端各留出 plate 的角向半宽，保证首尾图标/文字不越出扇形边界。
+        R = compactR0;
+        if (R < Rmin) R = Rmin;
+        if (R > Rmax) R = Rmax;
         for (int iter = 0; iter < 2000; iter++) {
-            double needDeg = neededArc / R * 180.0 / PI;   // 该半径下能放下的最小角度
-            if (needDeg < 60.0) needDeg = 60.0;
-            if (needDeg > 180.0) needDeg = 180.0;
-            aDeg = needDeg;
-            double availArc = R * aDeg * PI / 180.0;
-            if (availArc + 1e-3 >= neededArc) break;       // 当前半径放得下
-            R += util::Scaled(2);                          // 放不下才放大半径
-            if (R > halfDiag) { R = halfDiag; break; }
+            // 相邻两个中心的最小角间距（由弦长 >= itemStep 推导）
+            double chordAng = 0.0;
+            if (nIcons > 1) {
+                double x = itemStep / (2.0 * R);
+                if (x > 1.0) {
+                    chordAng = 180.0;   // 当前半径下即使 180° 也放不下
+                } else {
+                    chordAng = 2.0 * std::asin(x) * 180.0 / PI;
+                }
+            }
+
+            // aDeg 与边界留白相互依赖，做简单固定点迭代收敛
+            double span = 60.0;
+            aDeg = 60.0;
+            for (int fp = 0; fp < 30; fp++) {
+                double start = 270.0 - aDeg / 2.0;
+                double boundaryInset = RequiredBoundaryInset(
+                    R, start, (double)wMax / 2.0,
+                    (double)topInset, (double)bottomOut);
+                double need = (nIcons > 1)
+                    ? (2.0 * boundaryInset + (nIcons - 1) * chordAng)
+                    : (2.0 * boundaryInset);
+                if (need < 60.0) need = 60.0;
+                span = need;
+                double newA = need > 180.0 ? 180.0 : need;
+                if (std::fabs(newA - aDeg) < 0.05) { aDeg = newA; break; }
+                aDeg = newA;
+            }
+
+            if (span <= 180.0 + 1e-6) break;
+            R += util::Scaled(4);       // 放不下才放大半径
+            if (R > Rmax) { R = Rmax; aDeg = 180.0; break; }
         }
     }
 
-    // Rout/Rin 一律由 nIcons 推导出的中心半径 R 决定，带宽 bandT 恒定：
-    //   Rout = R + bandT/2 ,  Rin = R - bandT/2
-    // 只对 R 做必要的屏幕/最小镂空约束（不破坏 nIcons 决定的比例）
-    int Rmax = halfDiag - bandT / 2;          // 外层不超出屏幕
-    int Rmin = RinFloor + bandT / 2;          // 内镂空不小于最小值
-    if (R > Rmax) R = Rmax;
-    if (R < Rmin) R = Rmin;
-    if (R < util::Scaled(40)) R = util::Scaled(40);
     int Rout = R + bandT / 2;
     int Rin  = R - bandT / 2;
+    if (Rin < RinFloor) Rin = RinFloor;
     m_aDeg = aDeg;   // 记录展开角，供背景绘制保持一致
     if (nIcons == 0) {
         centers.clear();
@@ -345,23 +554,44 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
         return;
     }
 
-    // 均匀分布：Ring 等分 360°，Fan 在 [270°-aDeg/2, 270°+aDeg/2] 等分（开口朝下）
+    // 均匀分布：
+    // Ring 等分 360°（i/n，避免首尾重合）；
+    // Fan 在 [270°-aDeg/2, 270°+aDeg/2] 内，两端各留 boundaryInset 后均分。
     double startDeg = (m_data.style == ExpandStyle::Ring) ? 0.0 : (270.0 - aDeg / 2.0);
-    for (int i = 0; i < nIcons; i++) {
-        double deg = (nIcons > 1) ? (startDeg + aDeg * (double)i / (nIcons - 1))
-                                  : (startDeg + aDeg / 2.0);
-        double rad = deg * 3.141592653589793 / 180.0;
-        int cx = cex + (int)(R * std::cos(rad));
-        int cy = cey + (int)(R * std::sin(rad));
-        centers.push_back({ cx, cy });
+    if (nIcons == 1) {
+        double deg = (m_data.style == ExpandStyle::Ring) ? 0.0 : 270.0;
+        double rad = deg * PI / 180.0;
+        centers.push_back({ cex + (int)(R * std::cos(rad)),
+                            cey + (int)(R * std::sin(rad)) });
+    } else if (m_data.style == ExpandStyle::Ring) {
+        for (int i = 0; i < nIcons; i++) {
+            double deg = 360.0 * (double)i / (double)nIcons;
+            double rad = deg * PI / 180.0;
+            centers.push_back({ cex + (int)(R * std::cos(rad)),
+                                cey + (int)(R * std::sin(rad)) });
+        }
+    } else {
+        double boundaryInset = RequiredBoundaryInset(
+            R, startDeg, (double)wMax / 2.0,
+            (double)topInset, (double)bottomOut);
+        double usable = aDeg - 2.0 * boundaryInset;
+        if (usable < 0.0) usable = 0.0;
+        for (int i = 0; i < nIcons; i++) {
+            double deg = startDeg + boundaryInset +
+                         usable * (double)i / (double)(nIcons - 1);
+            double rad = deg * PI / 180.0;
+            centers.push_back({ cex + (int)(R * std::cos(rad)),
+                                cey + (int)(R * std::sin(rad)) });
+        }
     }
 
-    // 图标+文字都落在 [Rin, Rout] 带内，面板包围盒按实际外延计算，不超出扇面
-    int half = std::max(iconSize / 2 + util::Scaled(26), util::Scaled(30)) + (Rout - R);
+    // 包围盒按实际 plate 外延与扇面外径计算，保证所有条目/背景完整可见
     int minx = INT_MAX, miny = INT_MAX, maxx = INT_MIN, maxy = INT_MIN;
     for (auto& c : centers) {
-        minx = std::min(minx, (int)c.x - half); maxx = std::max(maxx, (int)c.x + half);
-        miny = std::min(miny, (int)c.y - half); maxy = std::max(maxy, (int)c.y + half);
+        minx = std::min(minx, (int)c.x - wMax / 2);
+        maxx = std::max(maxx, (int)c.x + wMax / 2);
+        miny = std::min(miny, (int)c.y - topInset);
+        maxy = std::max(maxy, (int)c.y + bottomOut);
     }
     minx = std::min(minx, cex - Rout); maxx = std::max(maxx, cex + Rout);
     miny = std::min(miny, cey - Rout); maxy = std::max(maxy, cey + Rout);
@@ -377,6 +607,7 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
     m_radius = R; m_rout = Rout; m_rin = Rin;
     m_labelW = util::Scaled(72);
 }
+
 int PanelWindow::ItemAt(POINT client) const {
     // 使用每个条目“实际区域”（plate 矩形）来命中，与 Windows 桌面图标一致
     for (size_t i = 0; i < m_plates.size(); i++) {
@@ -426,8 +657,10 @@ void PanelWindow::Draw(Graphics& g, int w, int h) {
 
 void PanelWindow::DrawPanelBackground(Graphics& g, int w, int h) {
     static const Color bg(210, 255, 255, 255);   // 白半透明 rgba(255,255,255,210)
-    if (m_data.style == ExpandStyle::Fan || m_data.style == ExpandStyle::Ring) {
+    if ((m_data.style == ExpandStyle::Fan || m_data.style == ExpandStyle::Ring) &&
+        !m_data.shortcuts.empty()) {
         // 使用 ComputeLayout 计算的自适应半径（与图标排布一致，防溢出）
+        // 空容器直接走下面的圆角矩形背景，避免为 80x40 的小窗画一个被裁剪的大扇环。
         int Rout = m_rout ? m_rout : util::Scaled(260);
         int Rin  = m_rin  ? m_rin  : util::Scaled(140);
         // 使用 ComputeLayout 算出的展开角（与图标排布一致）
@@ -439,57 +672,81 @@ void PanelWindow::DrawPanelBackground(Graphics& g, int w, int h) {
         // GDI+ 中正角度 = 顺时针（沿 y 向下方向增加）
         double s0 = startDeg;                   // 起始角度
         double sweep = aDeg;
-        // 圆环带（内外两个圆弧 + 两端连接）
-        GraphicsPath ring;
-        // 外弧（顺时针扫过整段）
-        ring.AddArc(Rect((int)(m_cx - Rout), (int)(m_cy - Rout),
-                         (int)(2 * Rout), (int)(2 * Rout)),
-                    (REAL)s0, (REAL)sweep);
-        // 连接外弧末端 → 内弧末端
         double e0 = (s0 + sweep);
-        double sRad = s0 * 3.141592653589793 / 180.0;
-        double eRad = e0 * 3.141592653589793 / 180.0;
+        const double PI = 3.141592653589793;
+        double sRad = s0 * PI / 180.0;
+        double eRad = e0 * PI / 180.0;
         double psx = m_cx + Rout * std::cos(sRad), psy = m_cy + Rout * std::sin(sRad);
         double pex = m_cx + Rout * std::cos(eRad), pey = m_cy + Rout * std::sin(eRad);
         double isx = m_cx + Rin * std::cos(sRad), isy = m_cy + Rin * std::sin(sRad);
         double iex = m_cx + Rin * std::cos(eRad), iey = m_cy + Rin * std::sin(eRad);
+
         if (m_data.style == ExpandStyle::Ring) {
-            // 用一条微弧/直线连接（360° 时起止点重合，直线退化为点）
-            ring.AddLine((int)pex, (int)pey, (int)iex, (int)iey);
-            // 内弧（反向，从 e0 到 s0）
+            // 环形：内外两个整圆弧 + 一条径向接缝
+            GraphicsPath ring;
+            ring.AddArc(Rect((int)(m_cx - Rout), (int)(m_cy - Rout),
+                             (int)(2 * Rout), (int)(2 * Rout)),
+                        (REAL)s0, (REAL)sweep);
+            ring.AddLine((REAL)pex, (REAL)pey, (REAL)iex, (REAL)iey);
             ring.AddArc(Rect((int)(m_cx - Rin), (int)(m_cy - Rin),
                              (int)(2 * Rin), (int)(2 * Rin)),
                         (REAL)e0, (REAL)-sweep);
-            // 连接内弧起点 → 外弧起点
-            ring.AddLine((int)isx, (int)isy, (int)psx, (int)psy);
+            ring.AddLine((REAL)isx, (REAL)isy, (REAL)psx, (REAL)psy);
+            ring.CloseFigure();
+            SolidBrush br(bg);
+            g.FillPath(&br, &ring);
         } else {
-            // Fan 扇面两侧“整条向外弯曲成弧”：沿半径为 Rin..Rout 之间的切线过渡。
-            // 用贝塞尔逼近弯曲边，让两侧呈外凸弧线（符合需求 3.5）
-            // 起始边：从外弧起点 (psx,psy) 到内弧起点 (isx,isy)
-            // 终点边：从内弧终点 (iex,iey) 到外弧终点 (pex,pey)
-            PointF p1((REAL)psx, (REAL)psy), p2((REAL)pex, (REAL)pey);
-            PointF q1((REAL)isx, (REAL)isy), q2((REAL)iex, (REAL)iey);
-            // 控制点取在中点并沿径向向外推，形成外凸弧
-            PointF c1((REAL)((psx+isx)/2.0f), (REAL)((psy+isy)/2.0f));
-            PointF c2((REAL)((pex+iex)/2.0f), (REAL)((pey+iey)/2.0f));
-            // 沿径向向外推控制点
-            double c1Rad = atan2(psy - m_cy, psx - m_cx);
-            double c2Rad = atan2(pey - m_cy, pex - m_cx);
-            float push = (Rout - Rin) * util::DpiScale() * 0.5f;
-            c1.X = (REAL)(m_cx + (Rout + push) * std::cos(c1Rad));
-            c1.Y = (REAL)(m_cy + (Rout + push) * std::sin(c1Rad));
-            c2.X = (REAL)(m_cx + (Rout + push) * std::cos(c2Rad));
-            c2.Y = (REAL)(m_cy + (Rout + push) * std::sin(c2Rad));
-            ring.AddBezier(p1, c1, c1, q1);   // 起始弯曲边
-            // 内弧
-            ring.AddArc(Rect((int)(m_cx - Rin), (int)(m_cy - Rin),
-                             (int)(2 * Rin), (int)(2 * Rin)),
-                        (REAL)e0, (REAL)-sweep);
-            ring.AddBezier(q2, c2, c2, p2);   // 终点弯曲边
+            // 扇形：两侧边为“整条向外弯曲”的贝塞尔弧。
+            // 为避免 GraphicsPath 对自交/外凸贝塞尔的填充不完整，
+            // 这里采样外弧、外凸侧边、内弧、外凸侧边构成多边形后填充。
+            // 侧边控制点取在内外半径中点，并向外侧偏转 DELTA 角度。
+            // 这样侧边在角度方向上外凸，但半径始终在 [Rin, Rout] 内，
+            // 不会跑到外弧之外形成多余区域。
+            const double DELTA = 0.15;
+            double rMid = (Rout + Rin) / 2.0;
+            PointF cEnd((REAL)(m_cx + rMid * std::cos(eRad + DELTA)),
+                        (REAL)(m_cy + rMid * std::sin(eRad + DELTA)));
+            PointF cStart((REAL)(m_cx + rMid * std::cos(sRad - DELTA)),
+                          (REAL)(m_cy + rMid * std::sin(sRad - DELTA)));
+            PointF pEnd((REAL)pex, (REAL)pey);
+            PointF pEndInner((REAL)iex, (REAL)iey);
+            PointF pStartInner((REAL)isx, (REAL)isy);
+            PointF pStart((REAL)psx, (REAL)psy);
+
+            std::vector<PointF> pts;
+            const int ARC_STEPS = 48;
+            const int BEZ_STEPS = 24;
+            // 外弧：s0 -> e0
+            for (int i = 0; i <= ARC_STEPS; i++) {
+                double ang = (s0 + sweep * (double)i / ARC_STEPS) * PI / 180.0;
+                pts.push_back(PointF((REAL)(m_cx + Rout * std::cos(ang)),
+                                     (REAL)(m_cy + Rout * std::sin(ang))));
+            }
+            // 侧边 1：外弧末端 -> 内弧末端，向外弯
+            for (int i = 0; i <= BEZ_STEPS; i++) {
+                double t = (double)i / BEZ_STEPS;
+                double mt = 1.0 - t;
+                double x = mt*mt*mt*pEnd.X + 3*mt*mt*t*cEnd.X + 3*mt*t*t*cEnd.X + t*t*t*pEndInner.X;
+                double y = mt*mt*mt*pEnd.Y + 3*mt*mt*t*cEnd.Y + 3*mt*t*t*cEnd.Y + t*t*t*pEndInner.Y;
+                pts.push_back(PointF((REAL)x, (REAL)y));
+            }
+            // 内弧：e0 -> s0
+            for (int i = 0; i <= ARC_STEPS; i++) {
+                double ang = (e0 - sweep * (double)i / ARC_STEPS) * PI / 180.0;
+                pts.push_back(PointF((REAL)(m_cx + Rin * std::cos(ang)),
+                                     (REAL)(m_cy + Rin * std::sin(ang))));
+            }
+            // 侧边 2：内弧起点 -> 外弧起点，向外弯
+            for (int i = 0; i <= BEZ_STEPS; i++) {
+                double t = (double)i / BEZ_STEPS;
+                double mt = 1.0 - t;
+                double x = mt*mt*mt*pStartInner.X + 3*mt*mt*t*cStart.X + 3*mt*t*t*cStart.X + t*t*t*pStart.X;
+                double y = mt*mt*mt*pStartInner.Y + 3*mt*mt*t*cStart.Y + 3*mt*t*t*cStart.Y + t*t*t*pStart.Y;
+                pts.push_back(PointF((REAL)x, (REAL)y));
+            }
+            SolidBrush br(bg);
+            g.FillPolygon(&br, pts.data(), (INT)pts.size());
         }
-        ring.CloseFigure();
-        SolidBrush br(bg);
-        g.FillPath(&br, &ring);
         return;
     }
     // Grid / Column / Row：白色半透明圆角矩形（12px 圆角）
@@ -509,13 +766,66 @@ LRESULT CALLBACK PanelWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     PanelWindow* self = (PanelWindow*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     switch (msg) {
         case WM_ACTIVATE:
-            if (LOWORD(wp) == WA_INACTIVE && self) { self->Close(); return 0; }
+            if (LOWORD(wp) == WA_INACTIVE && self && !self->m_inDragDrop) {
+                self->Close();
+                return 0;
+            }
             return 0;
-        case WM_LBUTTONUP: {
-            // 单击快捷方式即打开
+        case WM_LBUTTONDOWN: {
             if (!self) break;
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            self->m_dragIdx = self->ItemAt(pt);
+            self->m_downPt = pt;
+            self->m_draggingOut = false;
+            if (self->m_dragIdx >= 0) SetCapture(hwnd);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            if (!self) break;
+            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+
+            // 条目上按下并越过拖动阈值：启动“拖到桌面”
+            if (self->m_dragIdx >= 0 && !self->m_draggingOut) {
+                int dx = GetSystemMetrics(SM_CXDRAG);
+                int dy = GetSystemMetrics(SM_CYDRAG);
+                if (dx < 2) dx = 2;
+                if (dy < 2) dy = 2;
+                if (abs(pt.x - self->m_downPt.x) >= dx / 2 ||
+                    abs(pt.y - self->m_downPt.y) >= dy / 2) {
+                    self->DragStart(self->m_dragIdx, self->m_downPt);
+                }
+            }
+            if (self->m_draggingOut) {
+                POINT cp; GetCursorPos(&cp);
+                self->DragMove(cp);
+                return 0;
+            }
+
             int idx = self->ItemAt(pt);
+            if (idx != self->m_hoverItem) {
+                self->m_hoverItem = idx;
+                self->Render();
+            }
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+            return 0;
+        }
+        case WM_LBUTTONUP: {
+            if (!self) break;
+            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            if (self->m_draggingOut && self->m_dragIdx >= 0) {
+                // 拖出结束：在光标释放处判断是否放到桌面
+                POINT cp; GetCursorPos(&cp);
+                self->DragEnd(cp);
+                ReleaseCapture();
+                return 0;
+            }
+            int dragIdx = self->m_dragIdx;
+            self->m_dragIdx = -1;
+            self->m_draggingOut = false;
+            ReleaseCapture();
+            // 未发生拖动 → 视为单击：打开对应快捷方式
+            int idx = (dragIdx >= 0) ? dragIdx : self->ItemAt(pt);
             if (idx >= 0 && (size_t)idx < self->m_data.shortcuts.size()) {
                 const auto& e = self->m_data.shortcuts[idx];
                 ShellExecuteW(nullptr, L"open", e.path.c_str(), nullptr,
@@ -524,6 +834,10 @@ LRESULT CALLBACK PanelWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             self->Close();
             return 0;
         }
+        case WM_CAPTURECHANGED:
+            if (self && self->m_draggingOut) self->DragCancel();
+            if (self) { self->m_dragIdx = -1; }
+            return 0;
         case WM_KEYDOWN:
             if (wp == VK_ESCAPE && self) { self->Close(); return 0; }
             break;
@@ -538,18 +852,6 @@ LRESULT CALLBACK PanelWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 return TRUE;
             }
             break;
-        }
-        case WM_MOUSEMOVE: {
-            if (!self) break;
-            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-            int idx = self->ItemAt(pt);
-            if (idx != self->m_hoverItem) {
-                self->m_hoverItem = idx;
-                self->Render();
-            }
-            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
-            TrackMouseEvent(&tme);
-            return 0;
         }
         case WM_MOUSELEAVE:
             if (self && self->m_hoverItem != -1) {

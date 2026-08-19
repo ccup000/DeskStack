@@ -132,7 +132,10 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_DESTROY:
             Config::SaveNow();
-            Shell_NotifyIconW(NIM_DELETE, &NOTIFYICONDATAW{ sizeof(NOTIFYICONDATAW), hwnd, 1 });
+            {
+                NOTIFYICONDATAW nid = { sizeof(nid), hwnd, 1 };
+                Shell_NotifyIconW(NIM_DELETE, &nid);
+            }
             PostQuitMessage(0);
             return 0;
     }

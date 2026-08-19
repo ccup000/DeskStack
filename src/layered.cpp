@@ -46,7 +46,8 @@ void Present(HWND hwnd, int w, int h, int screenX, int screenY,
     // 先清零为全透明（Bitmap 初次包装未必已清零）
     {
         Gdiplus::BitmapData bd;
-        gdib.LockBits(&Gdiplus::Rect(0, 0, w, h),
+        Gdiplus::Rect rcLock(0, 0, w, h);
+        gdib.LockBits(&rcLock,
                       Gdiplus::ImageLockModeWrite, PixelFormat32bppARGB, &bd);
         if (bd.Scan0) memset(bd.Scan0, 0, (size_t)w * h * 4);
         gdib.UnlockBits(&bd);

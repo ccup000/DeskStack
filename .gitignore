@@ -15,3 +15,6 @@ Makefile
 # IDE
 .vs/
 .vscode/
+
+#其他
+issues.md
