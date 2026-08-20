@@ -293,6 +293,16 @@ bool PickIconFile(HWND owner, std::wstring& out) {
     return false;
 }
 
+void RestoreShortcutToSource(const ShortcutEntry& e) {
+    if (e.type != "lnk" || e.mode != ShortcutMode::Original)
+        return;
+    std::wstring src = e.sourcePath;
+    if (src.empty())
+        src = desktop::DesktopFolder() + L"\\" + e.name + L".lnk";
+    if (!e.path.empty() && GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES)
+        CopyFileW(e.path.c_str(), src.c_str(), FALSE);
+}
+
 } // namespace
 
 void ContainerWindow::RegisterClass(HINSTANCE hInst) {
@@ -482,11 +492,13 @@ void ContainerWindow::CloseActivePanel() {
 
 void ContainerWindow::AddShortcut(const std::wstring& srcPath) {
     std::wstring path = srcPath;
-    std::wstring name = NameNoExt(path);
+    // 名称/来源始终以快捷方式文件本身为准，不解析其指向的目标
+    std::wstring name = NameNoExt(srcPath);
     std::string type = util::GuessType(path);
+    std::wstring sourcePath = srcPath;
 
-    // .lnk 从桌面拖入 → 收纳：先复制到应用库目录，再从桌面移除
-    if (type == "lnk") {
+    // 原件模式：.lnk 复制到应用库目录，并移除原位置快捷方式
+    if (type == "lnk" && g_settings.shortcutMode == ShortcutMode::Original) {
         wchar_t appdata[MAX_PATH] = {};
         SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata);
         std::wstring lib = std::wstring(appdata) + L"/DeskStack/library";
@@ -494,17 +506,16 @@ void ContainerWindow::AddShortcut(const std::wstring& srcPath) {
         std::wstring dst = lib + L"\\" + BaseName(path);
         if (GetFileAttributesW(dst.c_str()) == INVALID_FILE_ATTRIBUTES)
             CopyFileW(path.c_str(), dst.c_str(), FALSE);
-        // 若源位于桌面则移除
-        std::wstring desk = desktop::DesktopFolder() + L"\\";
-        if (path.compare(0, desk.size(), desk) == 0)
-            DeleteFileW(path.c_str());
+        if (GetFileAttributesW(sourcePath.c_str()) != INVALID_FILE_ATTRIBUTES)
+            DeleteFileW(sourcePath.c_str());
         path = dst;
     }
-    m_data.shortcuts.push_back({ name, path, type });
+
+    m_data.shortcuts.push_back({ name, path, type, sourcePath, g_settings.shortcutMode });
     Render();
     Config::MarkDirty();
+    Config::SaveNow();
 }
-
 LRESULT CALLBACK ContainerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     ContainerWindow* self = (ContainerWindow*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     switch (msg) {
@@ -523,6 +534,10 @@ LRESULT CALLBACK ContainerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
             DragFinish(drop);
             return 0;
         }
+        case WM_MOUSEHOVER:
+            if (self && self->m_data.openMode == OpenMode::Hover && !self->m_pressed && !self->m_panel)
+                self->OpenPanel();
+            return 0;
         case WM_LBUTTONDOWN: {
             if (!self) break;
             self->m_downClient = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -536,7 +551,13 @@ LRESULT CALLBACK ContainerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
             return 0;
         }
         case WM_MOUSEMOVE: {
-            if (!self || !self->m_pressed) break;
+            if (!self) break;
+            // 悬停打开：容器打开方式为“悬停”时，跟踪鼠标悬停
+            if (self->m_data.openMode == OpenMode::Hover && !self->m_pressed && !self->m_panel) {
+                TRACKMOUSEEVENT tme = { sizeof(tme), TME_HOVER, hwnd, HOVER_DEFAULT };
+                TrackMouseEvent(&tme);
+            }
+            if (!self->m_pressed) break;
             POINT cur; GetCursorPos(&cur);
             if (!self->m_dragging) {
                 int tox = abs(cur.x - (self->m_downStartParent.x + self->m_offsetX));
@@ -620,15 +641,9 @@ LRESULT CALLBACK ContainerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
                     Config::MarkDirty();
                 }
             } else if (cmd == 1002) {
-                // 删除：把快捷方式放回桌面，再移除容器
-                for (auto& e : self->m_data.shortcuts) {
-                    std::wstring target = e.path;
-                    if (e.type == "lnk") {
-                        std::wstring t = desktop::LnkTarget(e.path);
-                        if (!t.empty()) target = t;
-                    }
-                    desktop::CreateDesktopShortcut(e.name, target);
-                }
+                // 删除：原件模式的快捷方式返回原位置，引用/普通文件不处理
+                for (auto& e : self->m_data.shortcuts)
+                    RestoreShortcutToSource(e);
                 if (g_owner) PostMessageW(g_owner, WM_CONTAINER_DELETE, (WPARAM)hwnd, 0);
             } else if (cmd == 1003) {
                 if (g_owner) PostMessageW(g_owner, WM_OPEN_MANAGER, 0, 0);

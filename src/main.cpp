@@ -8,6 +8,7 @@
 #include "panel.h"
 #include "config.h"
 #include "manager.h"
+#include "manager_tab.h"
 #include "desktop.h"
 #include "iconlib.h"
 #include "layered.h"
@@ -19,6 +20,7 @@
 
 std::vector<std::unique_ptr<ContainerWindow>> g_containers;
 HWND g_owner = nullptr;
+AppSettings g_settings;
 
 #define WM_TRAYICON (WM_APP + 1)
 
@@ -42,7 +44,11 @@ static void AddTrayIcon(HWND hwnd) {
 
 static void RevealConfigFile() {
     Config::SaveNow();
-    std::wstring args = L"/select,\"" + Config::Path() + L"\"";
+    std::wstring path = Config::Path();
+    // Explorer 的 /select 对反斜杠路径更稳定
+    for (auto& c : path)
+        if (c == L'/') c = L'\\';
+    std::wstring args = L"/select,\"" + path + L"\"";
     ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
 }
 
@@ -60,7 +66,7 @@ static void ShowTrayMenu(HWND hwnd) {
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
 
-    if (cmd == 10)      OpenManagerWindow(hwnd);
+    if (cmd == 10)      OpenManagerTabWindow(hwnd);
     else if (cmd == 12) RestoreAllContainers();
     else if (cmd == 13) Config::RemoveAll();
     else if (cmd == 14) RevealConfigFile();
@@ -89,7 +95,10 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_TRAYICON:
-            if (LOWORD(lp) == WM_RBUTTONUP) ShowTrayMenu(hwnd);
+            if (LOWORD(lp) == WM_LBUTTONDBLCLK)
+                OpenManagerTabWindow(hwnd);
+            else if (LOWORD(lp) == WM_RBUTTONUP)
+                ShowTrayMenu(hwnd);
             return 0;
         case WM_CONTAINER_DELETE: {
             HWND target = (HWND)wp;
@@ -99,7 +108,7 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_OPEN_MANAGER:
-            OpenManagerWindow(hwnd);
+            OpenManagerTabWindow(hwnd);
             return 0;
         case WM_REMOVE_ALL:
             Config::RemoveAll();

@@ -16,6 +16,7 @@ add_executable(DeskStack WIN32
     src/layered.cpp
     src/config.cpp
     src/manager.cpp
+    src/manager_tab.cpp
     src/desktop.cpp
     src/iconlib.cpp
     src/uinp.cpp

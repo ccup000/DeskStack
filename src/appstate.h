@@ -14,9 +14,19 @@ class PanelWindow;
 #define WM_SHOW_ALL          (WM_APP + 53)   // 恢复全部悬浮容器
 #define WM_REMOVE_ALL        (WM_APP + 54)   // 移除所有容器
 
+// 软件通用设置（全局）
+struct AppSettings {
+    int          maxChars   = 6;
+    int          maxLines   = 3;
+    double       outerScale = 1.0;
+    double       innerScale = 1.0;
+    ShortcutMode shortcutMode = ShortcutMode::Original;
+};
+
 // 全局应用状态
 extern std::vector<std::unique_ptr<ContainerWindow>> g_containers;
 extern HWND g_owner;                       // 托盘宿主窗口
+extern AppSettings g_settings;
 
 // 由 config.cpp 实现
 namespace Config { void MarkDirty(); bool SaveNow(); }

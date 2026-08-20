@@ -9,11 +9,15 @@
 // UI 全中文；配置内部字段保存英文枚举。
 
 enum class ExpandStyle { Grid, Column, Row, Fan, Ring };
+enum class OpenMode { Click, Hover };
+enum class ShortcutMode { Original, Reference };
 
 struct ShortcutEntry {
-    std::wstring name;      // 显示名
-    std::wstring path;      // 目标路径 (exe / lnk / 文件夹)
-    std::string  type;      // "exe" / "lnk" / "folder"（由程序自动识别，可省略）
+    std::wstring name;          // 显示名
+    std::wstring path;          // 当前保存/引用路径
+    std::string  type;          // "exe" / "lnk" / "folder"（由程序自动识别，可省略）
+    std::wstring sourcePath;    // 原始来源位置；未记录时按“来自桌面”处理
+    ShortcutMode mode = ShortcutMode::Original;  // 添加时的原件/引用模式
 };
 
 struct ContainerData {
@@ -23,6 +27,7 @@ struct ContainerData {
     int           col = 0;          // 网格索引（列）
     int           row = 0;          // 网格索引（行）
     ExpandStyle   style = ExpandStyle::Grid;
+    OpenMode      openMode = OpenMode::Click;
     int           gridCols = 5;     // 网格列数
     std::vector<ShortcutEntry> shortcuts;
 };
@@ -87,6 +92,22 @@ inline ExpandStyle StyleFromName(const std::string& n) {
     if (n == "Fan")    return ExpandStyle::Fan;
     if (n == "Ring")   return ExpandStyle::Ring;
     return ExpandStyle::Grid;
+}
+
+inline std::string OpenModeToName(OpenMode m) {
+    return m == OpenMode::Hover ? "Hover" : "Click";
+}
+
+inline OpenMode OpenModeFromName(const std::string& n) {
+    return n == "Hover" ? OpenMode::Hover : OpenMode::Click;
+}
+
+inline std::string ShortcutModeToName(ShortcutMode m) {
+    return m == ShortcutMode::Reference ? "Reference" : "Original";
+}
+
+inline ShortcutMode ShortcutModeFromName(const std::string& n) {
+    return n == "Reference" ? ShortcutMode::Reference : ShortcutMode::Original;
 }
 
 // 根据路径自动识别条目类型

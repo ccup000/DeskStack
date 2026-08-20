@@ -43,19 +43,18 @@ int EstimateTextWidth(const WCHAR* text, int fontSize) {
 }
 
 // 文字换行相关常量（可能后续需要微调）
-const int kTextCharsPerLine = 6;    // 每行最多约 6 个中文字符
-const int kTextMaxLines = 3;        // 最多 3 行
-
 // 布局用的文字宽度：限制在合理范围内（过长用省略号），避免间距/半径被长名撑大
 int LayoutLabelWidth(const WCHAR* t, int fontSize) {
     int w = EstimateTextWidth(t, fontSize);
-    int cap = fontSize * kTextCharsPerLine;   // 每行宽度上限约 6 字宽
+    int cap = fontSize * g_settings.maxChars;   // 每行宽度上限约 6 字宽
     return w < cap ? w : cap;
 }
 
-// 将文本按最多 kTextCharsPerLine 字符/行、最多 kTextMaxLines 行进行换行。
+// 将文本按最多 g_settings.maxChars 字符/行、最多 g_settings.maxLines 行进行换行。
 // 有空格时优先按空格断行；超出 3 行时第 3 行末尾加省略号。
 std::vector<std::wstring> WrapText(const std::wstring& text, int maxChars, int maxLines) {
+    if (maxChars <= 0) maxChars = 1;
+    if (maxLines <= 0) maxLines = 1;
     std::vector<std::wstring> result;
     if (text.empty()) return { L"" };
     if ((int)text.size() <= maxChars) return { text };
@@ -110,7 +109,7 @@ void DrawLabel(Graphics& g, const WCHAR* text, int cx, int cy, float size, int w
 void DrawWrappedLabel(Graphics& g, const WCHAR* text, int cx, int cy,
                       float size, int width, const Color& color) {
     std::vector<std::wstring> lines = WrapText(text ? text : L"",
-                                               kTextCharsPerLine, kTextMaxLines);
+                                               g_settings.maxChars, g_settings.maxLines);
     int lh = (int)(size + util::Scaled(6));
     int totalH = lh * (int)lines.size();
     int y0 = cy - totalH / 2;
@@ -322,7 +321,7 @@ PanelWindow::PanelWindow(ContainerWindow* owner, const ContainerData& data)
         int vpad = util::Scaled(6), hpad = util::Scaled(8);
         for (size_t i = 0; i < m_centers.size() && i < m_data.shortcuts.size(); i++) {
             int lw = LayoutLabelWidth(m_data.shortcuts[i].name.c_str(), util::Scaled(13));
-            int lines = WrappedLineCount(m_data.shortcuts[i].name, kTextCharsPerLine, kTextMaxLines);
+            int lines = WrappedLineCount(m_data.shortcuts[i].name, g_settings.maxChars, g_settings.maxLines);
             m_plates[i] = PlateRect(m_centers[i], m_iconSize, lw,
                                     labelH * lines, vpad, hpad);
         }
@@ -487,7 +486,7 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
         int maxPlatW = 0, maxPlatH = 0;
         for (int i = 0; i < n; i++) {
             int lw = LayoutLabelWidth(m_data.shortcuts[i].name.c_str(), util::Scaled(13));
-            int lines = WrappedLineCount(m_data.shortcuts[i].name, kTextCharsPerLine, kTextMaxLines);
+            int lines = WrappedLineCount(m_data.shortcuts[i].name, g_settings.maxChars, g_settings.maxLines);
             int pw = (lw > iconSize ? lw : iconSize) + 2 * hpad;
             int ph = iconSize + gapV + labelHx * lines + 2 * vpad;
             if (pw > maxPlatW) maxPlatW = pw;
@@ -558,7 +557,7 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
         int lw = LayoutLabelWidth(m_data.shortcuts[i].name.c_str(), font);
         int wItem = (lw > iconSize ? lw : iconSize) + 2 * hpad;
         if (wItem > wMax) wMax = wItem;
-        int lines = WrappedLineCount(m_data.shortcuts[i].name, kTextCharsPerLine, kTextMaxLines);
+        int lines = WrappedLineCount(m_data.shortcuts[i].name, g_settings.maxChars, g_settings.maxLines);
         if (lines > maxLines) maxLines = lines;
     }
     maxPlatH = iconSize + util::Scaled(6) + labelH * maxLines + 2 * vpad;
@@ -679,6 +678,16 @@ void PanelWindow::ComputeLayout(std::vector<POINT>& centers) {
         if (maxShift < 0) maxShift = 0;
         if (outwardShift > maxShift) outwardShift = maxShift;
         itemR += outwardShift;
+    }
+
+    // 外径/内径缩放：仅扇形/环形生效，只影响绘制边界到图标中心的距离
+    if (m_data.style == ExpandStyle::Fan || m_data.style == ExpandStyle::Ring) {
+        double outerDist = Rout - R;
+        double innerDist = R - Rin;
+        Rout = R + (int)(outerDist * g_settings.outerScale + 0.5);
+        Rin  = R - (int)(innerDist * g_settings.innerScale + 0.5);
+        if (Rin < RinFloor) Rin = RinFloor;
+        if (Rout < R) Rout = R;
     }
 
     m_aDeg = aDeg;   // 记录展开角，供背景绘制保持一致
@@ -817,10 +826,10 @@ void PanelWindow::DrawItem(Graphics& g, int idx, int iconSize,
         }
     }
     // 文字画在 plate 下部、居中、宽度限制在 plate 内。
-    // 超过 kTextCharsPerLine 会换行，最多 kTextMaxLines 行，第 3 行末尾省略。
+    // 超过 g_settings.maxChars 会换行，最多 g_settings.maxLines 行，第 3 行末尾省略。
     int labelW = pw - util::Scaled(4);
     int gap = util::Scaled(4);
-    int lines = WrappedLineCount(e.name, kTextCharsPerLine, kTextMaxLines);
+    int lines = WrappedLineCount(e.name, g_settings.maxChars, g_settings.maxLines);
     int labelH = (int)(util::Scaled(13) + util::Scaled(6));
     int ly = iy + iconSize + gap + labelH * lines / 2;   // 文字块垂直中心
     DrawWrappedLabel(g, e.name.c_str(), center.x, ly,

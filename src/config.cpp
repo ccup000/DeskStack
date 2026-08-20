@@ -39,12 +39,15 @@ json SaveOne(const ContainerWindow& c) {
     j["col"]        = d.col;
     j["row"]        = d.row;
     j["expandStyle"]= util::StyleToName(d.style);
+    j["openMode"]   = util::OpenModeToName(d.openMode);
     j["gridCols"]   = d.gridCols;
     json list = json::array();
     for (auto& e : d.shortcuts)
         list.push_back({ {"name", util::ToUtf8(e.name)},
                          {"path", util::ToUtf8(e.path)},
-                         {"type", e.type} });
+                         {"type", e.type},
+                         {"sourcePath", util::ToUtf8(e.sourcePath)},
+                         {"mode", util::ShortcutModeToName(e.mode)} });
     j["shortcutList"] = std::move(list);
     return j;
 }
@@ -62,6 +65,7 @@ void LoadOne(const json& j) {
     d.col      = j.value("col", 0);
     d.row      = j.value("row", 0);
     d.style    = util::StyleFromName(j.value("expandStyle", std::string("Grid")));
+    d.openMode = util::OpenModeFromName(j.value("openMode", std::string("Click")));
     d.gridCols = j.value("gridCols", 5);
     if (j.contains("shortcutList") && j["shortcutList"].is_array()) {
         for (auto& je : j["shortcutList"]) {
@@ -69,8 +73,17 @@ void LoadOne(const json& j) {
             e.name = AsW(je, "name");
             e.path = AsW(je, "path");
             e.type = je.value("type", std::string());
+            e.sourcePath = AsW(je, "sourcePath");
             if (e.path.empty()) continue;
             if (e.type.empty()) e.type = util::GuessType(e.path);
+            // 旧配置没有记录原始来源时，按“来自桌面”处理
+            if (e.sourcePath.empty()) {
+                std::wstring desk = desktop::DesktopFolder();
+                if (e.type == "lnk") e.sourcePath = desk + L"\\" + e.name + L".lnk";
+                else if (e.type == "folder") e.sourcePath = desk + L"\\" + e.name;
+                else e.sourcePath = desk + L"\\" + e.name + L".exe";
+            }
+            e.mode = util::ShortcutModeFromName(je.value("mode", std::string("Original")));
             d.shortcuts.push_back(std::move(e));
         }
     }
@@ -98,6 +111,13 @@ bool SaveNow() {
     json arr = json::array();
     for (auto& c : g_containers) arr.push_back(SaveOne(*c));
     j["containers"] = std::move(arr);
+    j["settings"] = {
+        { "maxChars",     g_settings.maxChars },
+        { "maxLines",     g_settings.maxLines },
+        { "outerScale",   g_settings.outerScale },
+        { "innerScale",   g_settings.innerScale },
+        { "shortcutMode", util::ShortcutModeToName(g_settings.shortcutMode) }
+    };
     std::string txt = j.dump(2);
 
     CreateDirectoryW(Dir().c_str(), nullptr);
@@ -127,6 +147,15 @@ bool LoadApp() {
                      std::istreambuf_iterator<char>());
     json j = json::parse(data, nullptr, false);
     if (j.is_discarded() || !j.is_object()) return false;
+    if (j.contains("settings") && j["settings"].is_object()) {
+        const auto& s = j["settings"];
+        g_settings.maxChars   = s.value("maxChars", 6);
+        g_settings.maxLines   = s.value("maxLines", 3);
+        g_settings.outerScale = s.value("outerScale", 1.0);
+        g_settings.innerScale = s.value("innerScale", 1.0);
+        g_settings.shortcutMode = util::ShortcutModeFromName(
+            s.value("shortcutMode", std::string("Original")));
+    }
     if (j.contains("containers") && j["containers"].is_array())
         for (auto& je : j["containers"]) LoadOne(je);
     return true;
